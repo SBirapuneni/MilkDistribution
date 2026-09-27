@@ -74,6 +74,7 @@ function doPost(e) {
       saveTripProgress: saveTripProgress,
       settleTrip: settleTrip,
       listTrips: listTrips,
+      getTodayStatus: getTodayStatus,
       getAnalytics: getAnalytics,
     };
 
@@ -371,6 +372,18 @@ function listTrips(payload) {
     const obj = stripRow_(t);
     obj.Date = formatDate_(t.Date);
     obj.RouteName = routeMap[t.RouteId] || t.RouteId;
+    return obj;
+  });
+}
+
+// One call for the whole Dashboard instead of two getTrip calls per route —
+// the Dashboard used to make 2xN requests (Morning + Evening per route), each
+// with real Apps Script overhead; this collapses it to a single request.
+function getTodayStatus(payload) {
+  const trips = readAll_(SHEET_NAMES.TRIPS).filter((t) => formatDate_(t.Date) === payload.date);
+  return trips.map((t) => {
+    const obj = stripRow_(t);
+    obj.Date = formatDate_(t.Date);
     return obj;
   });
 }

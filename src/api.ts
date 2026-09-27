@@ -109,6 +109,10 @@ export function listTrips(
   return DEMO_MODE ? mock.listTrips(payload) : call('listTrips', payload);
 }
 
+export function getTodayStatus(date: string): Promise<Trip[]> {
+  return DEMO_MODE ? mock.getTodayStatus(date) : call('getTodayStatus', { date });
+}
+
 export function getAnalytics(payload: { dateFrom?: string; dateTo?: string } = {}): Promise<Analytics> {
   return DEMO_MODE ? mock.getAnalytics(payload) : call('getAnalytics', payload);
 }

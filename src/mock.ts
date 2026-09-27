@@ -225,6 +225,10 @@ export async function listTrips(
     .map((t) => ({ ...t, RouteName: routeMap.get(t.RouteId) || t.RouteId }));
 }
 
+export async function getTodayStatus(date: string): Promise<Trip[]> {
+  return trips.filter((t) => t.Date === date).map((t) => ({ ...t }));
+}
+
 export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string } = {}): Promise<Analytics> {
   const settled = trips.filter((t) => {
     if (t.Status !== 'Settled') return false;
