@@ -1,0 +1,11 @@
+I need a application for milk distribution have a milk distribution shop which has five routes as of now
+
+Each route leads to multiple villages has one vehicle and one driver with milk products
+when driver returns back needs to handover cash and return stock if any
+
+I need a application for this 
+data should be stored in google sheets no data base
+application should be deployed to github pages
+
+should have master list for products and prices
+Each route should have one screen with stock that went on the route and prices , returned stock total amount driver should handover
