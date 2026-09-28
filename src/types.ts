@@ -55,15 +55,68 @@ export interface TripWithItems {
   items: TripItem[];
 }
 
+export interface Shop {
+  ShopId: string;
+  Name: string;
+  OwnerName: string;
+  Phone: string;
+  RouteId: string;
+  Active: boolean;
+  HasPin: boolean;
+}
+
 export interface MasterData {
   products: Product[];
   routes: Route[];
+  shops: Shop[];
+}
+
+/** A shop's order for one delivery (date + session). */
+export interface Indent {
+  indentId: string;
+  date: string;
+  session: Session;
+  shopId: string;
+  routeId: string;
+  items: { productId: string; qty: number }[];
+  total: number;
+  updatedAt: string; // 'yyyy-MM-dd HH:mm'
+}
+
+export interface DashboardData {
+  trips: Trip[];
+  orders: { routeId: string; session: Session; shops: number; ordered: number }[];
+}
+
+// ---- Shop owner portal ----
+
+export interface ShopProduct {
+  ProductId: string;
+  Name: string;
+  Unit: string;
+  Price: number;
+}
+
+export interface ShopSlot {
+  date: string;
+  session: Session;
+  cutoff: string; // 'yyyy-MM-dd HH:mm'
+  order: Indent | null;
+}
+
+export interface ShopHome {
+  shop: { name: string; ownerName: string; routeName: string };
+  products: ShopProduct[];
+  slots: ShopSlot[];
+  lastOrder: Indent | null;
+  now: string;
 }
 
 /** Everything the Route screen needs, in one request. */
 export interface RouteDay extends MasterData {
   session: Session; // the session to open
   trips: TripWithItems[]; // this route's trips on the date: 0–2, one per session
+  indents: Indent[]; // shop orders for this route on the date (both sessions)
 }
 
 export interface AnalyticsSummary {

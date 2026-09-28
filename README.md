@@ -44,6 +44,22 @@ Once logged in, go to **Products** and add your product list with prices, then g
 3. Go to **Settings > Pages** and set **Source** to **GitHub Actions**.
 4. Push to `main` (or run the "Deploy to GitHub Pages" workflow manually from the Actions tab). The site will build and publish automatically.
 
+## Shop orders
+
+Shops can place their own orders instead of phoning them in:
+
+1. Go to **Shops** and add each shop: name, owner, WhatsApp number and the route that serves it. Saving creates a **6-digit PIN**, shown once — tap **Share on WhatsApp** to send the owner the link, their phone number and PIN. **New PIN** replaces a lost or leaked PIN (the old one stops working).
+2. The shop owner opens the link (the site address ending in `#/order`, also linked from the staff login screen), logs in with phone + PIN and enters quantities for each upcoming delivery. They can change an order until its cutoff:
+   - **Morning** delivery: by **9 PM the night before**
+   - **Evening** delivery: by **12 noon the same day**
+
+   Cutoffs use the spreadsheet's time zone (**File > Settings**), so make sure it's your local one.
+3. On the **Route** screen, the Dispatch form lists that trip's shop orders, shows which shops haven't ordered, and pre-fills the quantities with the order totals — add extra for walk-in sales. The **Dashboard** shows how many shops on each route have ordered.
+
+Shop owners only ever see products, prices and their own orders; their PIN can't open any staff screen. PINs are stored only as salted hashes, and a phone number is locked for 15 minutes after 5 wrong PINs (without affecting other shops or staff). Orders are kept in the **Indents** tab, one row per shop per delivery, with a readable summary column.
+
+Upgrading an existing install: paste the new `Code.gs`, deploy a new version, and **run `setup` once** to add the `Shops` and `Indents` tabs.
+
 ## Daily use
 
 - **Dashboard**: today's totals (sent out, cash collected, trips awaiting return, cash short) and each route's Morning/Evening status — tap a session to go straight to it. Shortfalls show in red.
