@@ -10,6 +10,8 @@ const SHEET_NAMES = {
   ROUTES: 'Routes',
   TRIPS: 'Trips',
   TRIP_ITEMS: 'TripItems',
+  SHOPS: 'Shops',
+  INDENTS: 'Indents',
 };
 
 const HEADERS = {
@@ -23,6 +25,11 @@ const HEADERS = {
   TRIP_ITEMS: [
     'TripItemId', 'TripId', 'ProductId', 'Price', 'QtyDispatched', 'QtyReturned', 'DispatchedValue', 'ReturnedValue',
   ],
+  SHOPS: ['ShopId', 'Name', 'OwnerName', 'Phone', 'RouteId', 'Active', 'PinHash', 'PinSalt', 'CreatedAt'],
+  // One row per shop per delivery (date + session). Items is JSON
+  // ([{productId, qty}]) so an order is updated in place; Summary is the same
+  // order in readable form for anyone looking at the Sheet.
+  INDENTS: ['IndentId', 'Date', 'Session', 'ShopId', 'RouteId', 'Items', 'Summary', 'Total', 'UpdatedAt'],
 };
 
 const MIN_PASSCODE_LENGTH = 12;
@@ -34,7 +41,30 @@ const MIN_PASSCODE_LENGTH = 12;
 const MAX_FAILED_AUTH = 100;
 const FAILED_AUTH_WINDOW_SECONDS = 600;
 
+// Shop owners log in with phone number + PIN. Each phone gets its own
+// lock-out, so guessing one shop's PIN can't lock out the others (or staff).
+const SHOP_PIN_LENGTH = 6;
+const MAX_FAILED_SHOP_LOGINS = 5;
+const SHOP_LOCKOUT_SECONDS = 900;
+
+// Order cutoffs, in the spreadsheet's timezone: Morning delivery on day D
+// closes at 21:00 on D-1; Evening delivery on D closes at 12:00 on D.
+const CUTOFFS = {
+  Morning: { dayOffset: -1, time: '21:00' },
+  Evening: { dayOffset: 0, time: '12:00' },
+};
+
+// Actions a logged-in shop owner may call. Everything else needs the staff
+// passcode; a shop PIN can never reach them.
+const SHOP_ACTIONS = {
+  shopLogin: true,
+  shopSaveOrder: true,
+};
+
 const WRITE_ACTIONS = {
+  shopSaveOrder: true,
+  saveShop: true,
+  resetShopPin: true,
   saveProduct: true,
   saveRoute: true,
   dispatchTrip: true,
@@ -53,6 +83,8 @@ function setup() {
   ensureSheet_(ss, SHEET_NAMES.ROUTES, HEADERS.ROUTES);
   ensureSheet_(ss, SHEET_NAMES.TRIPS, HEADERS.TRIPS);
   ensureSheet_(ss, SHEET_NAMES.TRIP_ITEMS, HEADERS.TRIP_ITEMS);
+  ensureSheet_(ss, SHEET_NAMES.SHOPS, HEADERS.SHOPS);
+  ensureSheet_(ss, SHEET_NAMES.INDENTS, HEADERS.INDENTS);
 }
 
 function ensureSheet_(ss, name, headers) {
@@ -106,23 +138,15 @@ function doPost(e) {
     const payload = body.payload || {};
     const ctx = { user: String(body.user || '').trim().slice(0, 50) };
 
-    checkAppToken_(body.token);
-
-    const handlers = {
-      getMasterData: getMasterData,
-      saveProduct: saveProduct,
-      saveRoute: saveRoute,
-      getTrip: getTrip,
-      getRouteDay: getRouteDay,
-      getLastTrip: getLastTrip,
-      dispatchTrip: dispatchTrip,
-      saveTripProgress: saveTripProgress,
-      settleTrip: settleTrip,
-      reopenTrip: reopenTrip,
-      listTrips: listTrips,
-      getTodayStatus: getTodayStatus,
-      getAnalytics: getAnalytics,
-    };
+    let handlers;
+    if (SHOP_ACTIONS[action]) {
+      ctx.shop = checkShopLogin_(body.shop);
+      ctx.user = 'Shop: ' + ctx.shop.Name;
+      handlers = { shopLogin: shopLogin, shopSaveOrder: shopSaveOrder };
+    } else {
+      checkAppToken_(body.token);
+      handlers = staffHandlers_();
+    }
 
     if (!handlers[action]) {
       throw new Error('Unknown action: ' + action);
@@ -151,6 +175,27 @@ function doPost(e) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function staffHandlers_() {
+  return {
+    getMasterData: getMasterData,
+    saveProduct: saveProduct,
+    saveRoute: saveRoute,
+    getTrip: getTrip,
+    getRouteDay: getRouteDay,
+    getLastTrip: getLastTrip,
+    dispatchTrip: dispatchTrip,
+    saveTripProgress: saveTripProgress,
+    settleTrip: settleTrip,
+    reopenTrip: reopenTrip,
+    listTrips: listTrips,
+    getTodayStatus: getTodayStatus,
+    getAnalytics: getAnalytics,
+    getDashboard: getDashboard,
+    saveShop: saveShop,
+    resetShopPin: resetShopPin,
+  };
+}
+
 // ---- Auth ------------------------------------------------------------
 
 function checkAppToken_(token) {
@@ -176,6 +221,42 @@ function checkAdminToken_(token) {
   }
 }
 
+// Phone numbers are compared as their last 10 digits, so "+91 98480 12345",
+// "098480-12345" and "9848012345" are the same shop.
+function normalizePhone_(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+function hashPin_(pin, salt) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + ':' + pin);
+  return Utilities.base64Encode(bytes);
+}
+
+function checkShopLogin_(creds) {
+  const phone = normalizePhone_(creds && creds.phone);
+  const pin = String((creds && creds.pin) || '');
+  if (!phone) throw new Error('Enter your 10-digit phone number.');
+
+  const cache = CacheService.getScriptCache();
+  const key = 'shopFail:' + phone;
+  const failures = Number(cache.get(key) || 0);
+  if (failures >= MAX_FAILED_SHOP_LOGINS) {
+    throw new Error('Too many wrong PINs. Try again in 15 minutes, or ask the distributor to reset your PIN.');
+  }
+
+  const shop = readAllIfExists_(SHEET_NAMES.SHOPS).filter((s) => normalizePhone_(s.Phone) === phone)[0];
+  const ok = shop && isActive_(shop.Active) && shop.PinHash && hashPin_(pin, shop.PinSalt) === shop.PinHash;
+  if (!ok) {
+    // Same message whether the phone is unknown or the PIN is wrong, so the
+    // login can't be used to discover which numbers are registered.
+    cache.put(key, String(failures + 1), SHOP_LOCKOUT_SECONDS);
+    throw new Error('Incorrect phone number or PIN.');
+  }
+  if (failures > 0) cache.remove(key);
+  return shop;
+}
+
 function recordAuthFailure_(cache, failures) {
   cache.put('failedAuth', String(failures + 1), FAILED_AUTH_WINDOW_SECONDS);
 }
@@ -184,7 +265,7 @@ function recordAuthFailure_(cache, failures) {
 
 function getSheet_(name) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
-  if (!sheet) throw new Error('Sheet not found: ' + name);
+  if (!sheet) throw new Error('Sheet not found: ' + name + '. Run setup() in Apps Script to add it.');
   return sheet;
 }
 
@@ -204,6 +285,12 @@ function readAll_(sheetName) {
     rows.push(obj);
   }
   return rows;
+}
+
+// For the shop tabs, which only exist once setup() has been re-run after
+// upgrading: treat a missing tab as empty instead of breaking every screen.
+function readAllIfExists_(sheetName) {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName) ? readAll_(sheetName) : [];
 }
 
 function appendObject_(sheetName, obj) {
@@ -261,6 +348,20 @@ function getMasterData() {
   return {
     products: readAll_(SHEET_NAMES.PRODUCTS).map(stripRow_),
     routes: readAll_(SHEET_NAMES.ROUTES).map(stripRow_),
+    shops: readAllIfExists_(SHEET_NAMES.SHOPS).map(publicShop_),
+  };
+}
+
+// A shop row without its PIN hash/salt — the only form that leaves the server.
+function publicShop_(s) {
+  return {
+    ShopId: s.ShopId,
+    Name: s.Name,
+    OwnerName: s.OwnerName,
+    Phone: String(s.Phone).replace(/^'/, ''),
+    RouteId: s.RouteId,
+    Active: s.Active,
+    HasPin: !!s.PinHash,
   };
 }
 
@@ -311,6 +412,240 @@ function saveRoute(payload) {
   const id = newId_('R');
   appendObject_(SHEET_NAMES.ROUTES, Object.assign({ RouteId: id }, fields));
   return Object.assign({ routeId: id }, getMasterData());
+}
+
+// ---- Shops (staff) -----------------------------------------------------------
+
+function newPin_() {
+  // Digits taken from a random UUID: better randomness than Math.random().
+  const hex = Utilities.getUuid().replace(/-/g, '');
+  let pin = '';
+  for (let i = 0; pin.length < SHOP_PIN_LENGTH && i < hex.length; i++) {
+    const d = parseInt(hex[i], 16);
+    if (d < 10) pin += d;
+  }
+  while (pin.length < SHOP_PIN_LENGTH) pin += Math.floor(Math.random() * 10);
+  return pin;
+}
+
+function pinFields_() {
+  const pin = newPin_();
+  const salt = Utilities.getUuid();
+  return { pin: pin, fields: { PinHash: hashPin_(pin, salt), PinSalt: salt } };
+}
+
+// Creates or updates a shop. A new shop gets a PIN, returned once in the
+// response (only its hash is stored) so the admin can share it.
+function saveShop(payload) {
+  const name = String(payload.name || '').trim();
+  const phone = normalizePhone_(payload.phone);
+  if (!name) throw new Error('Shop name is required');
+  if (!phone) throw new Error('Enter a 10-digit phone number');
+  if (!payload.routeId) throw new Error('Pick the route that serves this shop');
+
+  const shops = readAll_(SHEET_NAMES.SHOPS);
+  const clash = shops.filter((s) => normalizePhone_(s.Phone) === phone && s.ShopId !== payload.shopId)[0];
+  if (clash) throw new Error('Another shop (' + clash.Name + ') already uses this phone number');
+
+  // Stored with a leading apostrophe so Sheets keeps it as text (no lost
+  // leading zeros, no scientific notation).
+  const fields = {
+    Name: name,
+    OwnerName: String(payload.ownerName || '').trim(),
+    Phone: "'" + phone,
+    RouteId: payload.routeId,
+    Active: payload.active !== false,
+  };
+
+  let pin = null;
+  let shopId = payload.shopId;
+  if (shopId) {
+    const existing = shops.filter((s) => s.ShopId === shopId)[0];
+    if (!existing) throw new Error('Shop not found');
+    updateObjectByRow_(SHEET_NAMES.SHOPS, existing.__row, fields);
+  } else {
+    shopId = newId_('S');
+    const generated = pinFields_();
+    pin = generated.pin;
+    appendObject_(SHEET_NAMES.SHOPS, Object.assign({ ShopId: shopId, CreatedAt: new Date() }, fields, generated.fields));
+  }
+  return Object.assign({ shopId: shopId, pin: pin }, getMasterData());
+}
+
+function resetShopPin(payload) {
+  const shop = readAll_(SHEET_NAMES.SHOPS).filter((s) => s.ShopId === payload.shopId)[0];
+  if (!shop) throw new Error('Shop not found');
+  const generated = pinFields_();
+  updateObjectByRow_(SHEET_NAMES.SHOPS, shop.__row, generated.fields);
+  CacheService.getScriptCache().remove('shopFail:' + normalizePhone_(shop.Phone));
+  return { shopId: shop.ShopId, pin: generated.pin };
+}
+
+// ---- Shop orders (indents) ---------------------------------------------------
+
+function tz_() {
+  if (!spreadsheetTimeZone_) spreadsheetTimeZone_ = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+  return spreadsheetTimeZone_;
+}
+
+/** 'yyyy-MM-dd HH:mm' now, in the spreadsheet's timezone. */
+function nowStamp_() {
+  return Utilities.formatDate(new Date(), tz_(), 'yyyy-MM-dd HH:mm');
+}
+
+function addDaysStr_(date, n) {
+  const parts = String(date).split('-').map(Number);
+  const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] + n));
+  return d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2);
+}
+
+/** When ordering for this delivery closes, as 'yyyy-MM-dd HH:mm'. */
+function cutoffFor_(date, session) {
+  const c = CUTOFFS[session];
+  return addDaysStr_(date, c.dayOffset) + ' ' + c.time;
+}
+
+// Deliveries a shop can still order for: cutoff not yet passed and at most
+// 24 hours away (stretched to always include tomorrow's Evening). In the
+// morning that's today's Evening, tomorrow's Morning and tomorrow's Evening;
+// late at night it's tomorrow's Evening and the next day's Morning.
+function openSlots_() {
+  const now = nowStamp_();
+  const today = now.slice(0, 10);
+  const horizon = addDaysStr_(today, 1) + ' ' + now.slice(11);
+  const horizonEnd = horizon < addDaysStr_(today, 1) + ' 12:00' ? addDaysStr_(today, 1) + ' 12:00' : horizon;
+  const slots = [];
+  [0, 1, 2].forEach((offset) => {
+    const date = addDaysStr_(today, offset);
+    ['Morning', 'Evening'].forEach((session) => {
+      const cutoff = cutoffFor_(date, session);
+      if (cutoff > now && cutoff <= horizonEnd) slots.push({ date: date, session: session, cutoff: cutoff });
+    });
+  });
+  return slots;
+}
+
+function parseItems_(json) {
+  try {
+    const items = JSON.parse(json || '[]');
+    return Array.isArray(items) ? items : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function indentView_(row) {
+  return {
+    indentId: row.IndentId,
+    date: formatDate_(row.Date),
+    session: row.Session,
+    shopId: row.ShopId,
+    routeId: row.RouteId,
+    items: parseItems_(row.Items),
+    total: Number(row.Total) || 0,
+    updatedAt: row.UpdatedAt ? Utilities.formatDate(new Date(row.UpdatedAt), tz_(), 'yyyy-MM-dd HH:mm') : '',
+  };
+}
+
+function shopLogin(payload, ctx) {
+  const shop = ctx.shop;
+  const route = readAll_(SHEET_NAMES.ROUTES).filter((r) => r.RouteId === shop.RouteId)[0];
+  const products = readAll_(SHEET_NAMES.PRODUCTS)
+    .filter((p) => isActive_(p.Active))
+    .map((p) => ({ ProductId: p.ProductId, Name: p.Name, Unit: p.Unit, Price: Number(p.Price) || 0 }));
+
+  const mine = readAll_(SHEET_NAMES.INDENTS).filter((r) => r.ShopId === shop.ShopId).map(indentView_);
+  const slots = openSlots_().map((slot) => {
+    const existing = mine.filter((o) => o.date === slot.date && o.session === slot.session)[0];
+    return Object.assign({}, slot, { order: existing || null });
+  });
+  // Most recent non-empty order before the first open slot, for "same as last order".
+  const firstOpen = slots.length ? slots[0].date + ' ' + slots[0].session : '9999';
+  const last = mine
+    .filter((o) => o.items.length && o.date + ' ' + o.session < firstOpen)
+    .sort((a, b) => (b.date + b.session).localeCompare(a.date + a.session))[0];
+
+  return {
+    shop: { name: shop.Name, ownerName: shop.OwnerName, routeName: route ? route.Name : '' },
+    products: products,
+    slots: slots,
+    lastOrder: last || null,
+    now: nowStamp_(),
+  };
+}
+
+function shopSaveOrder(payload, ctx) {
+  const shop = ctx.shop;
+  const session = payload.session;
+  if (session !== 'Morning' && session !== 'Evening') throw new Error('Pick Morning or Evening');
+  const slot = openSlots_().filter((s) => s.date === payload.date && s.session === session)[0];
+  if (!slot) throw new Error('Ordering for this delivery has closed.');
+
+  const products = {};
+  readAll_(SHEET_NAMES.PRODUCTS).filter((p) => isActive_(p.Active)).forEach((p) => { products[p.ProductId] = p; });
+
+  const items = [];
+  const summary = [];
+  let total = 0;
+  (payload.items || []).forEach((i) => {
+    const qty = Number(i.qty) || 0;
+    if (qty <= 0) return;
+    if (qty > 10000) throw new Error('Quantity too large');
+    const p = products[i.productId];
+    if (!p) throw new Error('This product is no longer available. Refresh and try again.');
+    items.push({ productId: i.productId, qty: qty });
+    summary.push(p.Name + ' × ' + qty);
+    total += qty * (Number(p.Price) || 0);
+  });
+
+  const fields = {
+    Date: payload.date,
+    Session: session,
+    ShopId: shop.ShopId,
+    RouteId: shop.RouteId,
+    Items: JSON.stringify(items),
+    Summary: summary.join(', '),
+    Total: total,
+    UpdatedAt: new Date(),
+  };
+  const existing = readAll_(SHEET_NAMES.INDENTS).filter(
+    (r) => r.ShopId === shop.ShopId && formatDate_(r.Date) === payload.date && r.Session === session,
+  )[0];
+  if (existing) {
+    updateObjectByRow_(SHEET_NAMES.INDENTS, existing.__row, fields);
+  } else {
+    appendObject_(SHEET_NAMES.INDENTS, Object.assign({ IndentId: newId_('I') }, fields));
+  }
+  return shopLogin(payload, ctx);
+}
+
+/** Shop orders for a date (optionally one route), non-empty only. */
+function indentsFor_(date, routeId) {
+  return readAllIfExists_(SHEET_NAMES.INDENTS)
+    .filter((r) => formatDate_(r.Date) === date && (!routeId || r.RouteId === routeId))
+    .map(indentView_)
+    .filter((o) => o.items.length > 0);
+}
+
+// Dashboard in one request: today's trips plus shop-order counts per route
+// and session.
+function getDashboard(payload) {
+  const trips = getTodayStatus(payload);
+  const indents = indentsFor_(payload.date);
+  const shops = readAllIfExists_(SHEET_NAMES.SHOPS).filter((s) => isActive_(s.Active));
+  const orders = {};
+  shops.forEach((s) => {
+    ['Morning', 'Evening'].forEach((session) => {
+      const key = s.RouteId + '|' + session;
+      if (!orders[key]) orders[key] = { routeId: s.RouteId, session: session, shops: 0, ordered: 0 };
+      orders[key].shops += 1;
+    });
+  });
+  indents.forEach((o) => {
+    const key = o.routeId + '|' + o.session;
+    if (orders[key]) orders[key].ordered += 1;
+  });
+  return { trips: trips, orders: Object.keys(orders).map((k) => orders[k]) };
 }
 
 // ---- Trips -----------------------------------------------------------
@@ -497,7 +832,14 @@ function getRouteDay(payload) {
   }
 
   const master = getMasterData();
-  return { products: master.products, routes: master.routes, session: session, trips: days };
+  return {
+    products: master.products,
+    routes: master.routes,
+    shops: master.shops,
+    session: session,
+    trips: days,
+    indents: indentsFor_(payload.date, payload.routeId),
+  };
 }
 
 // The most recent earlier trip for this route and session — used to pre-fill

@@ -1,6 +1,6 @@
 import { navHtml, wireNav } from '../components/nav';
 import { dispatchTrip, getLastTrip, getRouteDay, reopenTrip, saveTripProgress, settleTrip } from '../api';
-import type { Product, Route, RouteDay, Session, Trip, TripWithItems } from '../types';
+import type { Indent, Product, Route, RouteDay, Session, Shop, Trip, TripWithItems } from '../types';
 import { escapeHtml, localDateStr, money, shortDate } from '../util';
 
 const SESSIONS: Session[] = ['Morning', 'Evening'];
@@ -142,8 +142,10 @@ export async function renderRouteScreen(container: HTMLElement, routeId: string,
     const tripBody = main.querySelector<HTMLDivElement>('#trip-body')!;
 
     if (!tripData) {
-      tripBody.innerHTML = renderDispatchForm(route, activeProducts, session);
-      wireDispatchForm(tripBody, routeId, date, session, applyTrip);
+      const orders = data.indents.filter((o) => o.session === session);
+      const routeShops = (data.shops ?? []).filter((s) => s.RouteId === routeId && s.Active !== false && String(s.Active).toUpperCase() !== 'FALSE');
+      tripBody.innerHTML = renderShopOrders(orders, routeShops, productMap) + renderDispatchForm(route, activeProducts, session, orders.length > 0);
+      wireDispatchForm(tripBody, routeId, date, session, applyTrip, orderTotals(orders));
     } else if (tripData.trip.Status === 'Dispatched') {
       tripBody.innerHTML = renderSettleForm(tripData, productMap);
       pendingSave = wireSettleForm(tripBody, tripData, applyTrip, (saved) => trips.set(session, saved));
@@ -156,6 +158,51 @@ export async function renderRouteScreen(container: HTMLElement, routeId: string,
   await load(localDateStr(), initialSession);
 }
 
+// Total quantity per product across the shops' orders for this trip.
+function orderTotals(orders: Indent[]): Map<string, number> {
+  const totals = new Map<string, number>();
+  orders.forEach((o) => o.items.forEach((i) => totals.set(i.productId, (totals.get(i.productId) ?? 0) + i.qty)));
+  return totals;
+}
+
+function orderSummary(items: { productId: string; qty: number }[], productMap: Map<string, Product>): string {
+  return items.map((i) => `${productMap.get(i.productId)?.Name ?? i.productId} × ${i.qty}`).join(', ');
+}
+
+function renderShopOrders(orders: Indent[], routeShops: Shop[], productMap: Map<string, Product>): string {
+  if (routeShops.length === 0) return '';
+  const shopName = new Map(routeShops.map((s) => [s.ShopId, s.Name]));
+  const orderedIds = new Set(orders.map((o) => o.shopId));
+  const notOrdered = routeShops.filter((s) => !orderedIds.has(s.ShopId));
+  const totals = Array.from(orderTotals(orders).entries()).map(([productId, qty]) => ({ productId, qty }));
+
+  return `
+    <details class="shop-orders" ${orders.length ? 'open' : ''}>
+      <summary><strong>Shop orders</strong> · ${orders.length} of ${routeShops.length} shop${routeShops.length === 1 ? '' : 's'} ordered</summary>
+      ${
+        orders.length
+          ? `<div class="table-scroll"><table class="line-items">
+              <thead><tr><th>Shop</th><th>Order</th><th class="num">Value</th></tr></thead>
+              <tbody>
+                ${orders
+                  .map(
+                    (o) => `<tr>
+                      <td class="nowrap">${escapeHtml(shopName.get(o.shopId) ?? o.shopId)}</td>
+                      <td>${escapeHtml(orderSummary(o.items, productMap))}</td>
+                      <td class="num">${money(o.total)}</td>
+                    </tr>`,
+                  )
+                  .join('')}
+              </tbody>
+              <tfoot><tr><td>Total</td><td>${escapeHtml(orderSummary(totals, productMap))}</td><td class="num">${money(orders.reduce((s, o) => s + o.total, 0))}</td></tr></tfoot>
+            </table></div>`
+          : ''
+      }
+      ${notOrdered.length ? `<p class="muted">Not ordered: ${notOrdered.map((s) => escapeHtml(s.Name)).join(', ')}</p>` : ''}
+    </details>
+  `;
+}
+
 function renderAuditTrail(trip: Trip): string {
   const parts: string[] = [];
   if (trip.DispatchedBy) parts.push(`Dispatched by ${escapeHtml(trip.DispatchedBy)}`);
@@ -164,7 +211,7 @@ function renderAuditTrail(trip: Trip): string {
   return parts.length ? `<p class="muted audit">${parts.join(' · ')}</p>` : '';
 }
 
-function renderDispatchForm(route: Route, products: Product[], session: Session): string {
+function renderDispatchForm(route: Route, products: Product[], session: Session, hasOrders: boolean): string {
   if (products.length === 0) {
     return '<p>No active products. Add some on the Products page before dispatching.</p>';
   }
@@ -176,6 +223,7 @@ function renderDispatchForm(route: Route, products: Product[], session: Session)
         <label>Vehicle <input type="text" name="vehicle" value="${escapeHtml(route.DefaultVehicle)}" required /></label>
       </div>
       <div class="field-row">
+        ${hasOrders ? '<button type="button" id="fill-orders-btn" class="secondary">Fill from shop orders</button>' : ''}
         <button type="button" id="copy-last-btn" class="secondary">Same as last ${session} trip</button>
         <span id="copy-last-status" class="muted"></span>
       </div>
@@ -209,6 +257,7 @@ function wireDispatchForm(
   date: string,
   session: Session,
   onDone: (tripData: TripWithItems) => void,
+  shopTotals: Map<string, number>,
 ) {
   const form = container.querySelector<HTMLFormElement>('#dispatch-form');
   if (!form) return;
@@ -235,6 +284,19 @@ function wireDispatchForm(
 
   const copyBtn = form.querySelector<HTMLButtonElement>('#copy-last-btn')!;
   const copyStatus = form.querySelector<HTMLSpanElement>('#copy-last-status')!;
+
+  // Start from what the shops ordered; staff add extra for walk-in sales and
+  // shops that didn't order.
+  function fillFromOrders() {
+    rows.forEach((row) => {
+      const qty = shopTotals.get(row.dataset.productId!);
+      row.querySelector<HTMLInputElement>('.qty-input')!.value = qty ? String(qty) : '';
+    });
+    recalc();
+    copyStatus.textContent = 'Filled with the shop order totals — add extra for shops that didn\'t order.';
+  }
+  if (shopTotals.size > 0) fillFromOrders();
+  form.querySelector('#fill-orders-btn')?.addEventListener('click', fillFromOrders);
   copyBtn.addEventListener('click', async () => {
     copyBtn.disabled = true;
     copyStatus.textContent = 'Loading...';

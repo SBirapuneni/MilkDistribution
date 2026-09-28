@@ -14,6 +14,8 @@ import type {
   TripItem,
   TripWithItems,
 } from './types';
+import type { DashboardData, Indent, Shop, ShopHome, ShopSlot } from './types';
+import { addDays, localDateStr } from './util';
 
 const products: Product[] = [
   { ProductId: 'P1', Name: 'Whole Milk', Unit: 'litre', Price: 60, Active: true },
@@ -34,12 +36,31 @@ export const DEMO_ADMIN_PASSCODE = 'admin';
 const trips: Trip[] = [];
 const tripItems: TripItem[] = [];
 
+// Demo shops. In demo mode PINs are kept in plain text; the real backend
+// stores only a salted hash.
+export const DEMO_SHOPS = [
+  { phone: '9000000001', pin: '111111' },
+  { phone: '9000000002', pin: '222222' },
+  { phone: '9000000003', pin: '333333' },
+];
+const shops: (Shop & { pin: string })[] = [
+  { ShopId: 'S1', Name: 'Lakshmi Stores', OwnerName: 'Ravi', Phone: '9000000001', RouteId: 'R1', Active: true, HasPin: true, pin: '111111' },
+  { ShopId: 'S2', Name: 'Sri Sai Traders', OwnerName: 'Padma', Phone: '9000000002', RouteId: 'R1', Active: true, HasPin: true, pin: '222222' },
+  { ShopId: 'S3', Name: 'Balaji Kirana', OwnerName: 'Suresh', Phone: '9000000003', RouteId: 'R2', Active: true, HasPin: true, pin: '333333' },
+];
+const indents: Indent[] = [];
+
+function publicShop({ pin: _pin, ...shop }: Shop & { pin: string }): Shop {
+  void _pin;
+  return { ...shop };
+}
+
 function newId(prefix: string): string {
   return prefix + Date.now() + Math.floor(Math.random() * 1000);
 }
 
 export async function getMasterData(): Promise<MasterData> {
-  return { products: [...products], routes: [...routes] };
+  return { products: [...products], routes: [...routes], shops: shops.map(publicShop) };
 }
 
 export async function saveProduct(payload: {
@@ -115,7 +136,12 @@ export async function getRouteDay(payload: {
   const awaiting = (['Morning', 'Evening'] as Session[]).find((s) =>
     days.some((d) => d.trip.Session === s && d.trip.Status === 'Dispatched'),
   );
-  return { ...(await getMasterData()), session: payload.session ?? awaiting ?? payload.fallbackSession, trips: days };
+  return {
+    ...(await getMasterData()),
+    session: payload.session ?? awaiting ?? payload.fallbackSession,
+    trips: days,
+    indents: indents.filter((o) => o.routeId === payload.routeId && o.date === payload.date && o.items.length > 0),
+  };
 }
 
 export async function getLastTrip(routeId: string, session: Session, beforeDate: string): Promise<TripWithItems | null> {
@@ -422,4 +448,134 @@ function computeAnalytics(payload: { dateFrom?: string; dateTo?: string }): Anal
     bySession: Array.from(bySessionMap.values()),
     byProduct: Array.from(byProductMap.values()).sort((a, b) => b.revenue - a.revenue),
   };
+}
+
+// ---- Shops & shop orders (mirrors Code.gs) ----
+
+function normalizePhone(phone: string): string {
+  const digits = String(phone || '').replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : '';
+}
+
+function newPin(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+export async function saveShop(payload: {
+  shopId?: string;
+  name: string;
+  ownerName: string;
+  phone: string;
+  routeId: string;
+  active: boolean;
+}): Promise<{ shopId: string; pin: string | null } & MasterData> {
+  const phone = normalizePhone(payload.phone);
+  if (!payload.name.trim()) throw new Error('Shop name is required');
+  if (!phone) throw new Error('Enter a 10-digit phone number');
+  if (!payload.routeId) throw new Error('Pick the route that serves this shop');
+  const clash = shops.find((s) => s.Phone === phone && s.ShopId !== payload.shopId);
+  if (clash) throw new Error(`Another shop (${clash.Name}) already uses this phone number`);
+  const fields = { Name: payload.name.trim(), OwnerName: payload.ownerName.trim(), Phone: phone, RouteId: payload.routeId, Active: payload.active };
+  if (payload.shopId) {
+    const existing = shops.find((s) => s.ShopId === payload.shopId);
+    if (!existing) throw new Error('Shop not found');
+    Object.assign(existing, fields);
+    return { shopId: existing.ShopId, pin: null, ...(await getMasterData()) };
+  }
+  const pin = newPin();
+  const shopId = newId('S');
+  shops.push({ ShopId: shopId, HasPin: true, pin, ...fields });
+  return { shopId, pin, ...(await getMasterData()) };
+}
+
+export async function resetShopPin(shopId: string): Promise<{ shopId: string; pin: string }> {
+  const shop = shops.find((s) => s.ShopId === shopId);
+  if (!shop) throw new Error('Shop not found');
+  shop.pin = newPin();
+  return { shopId, pin: shop.pin };
+}
+
+function nowStamp(): string {
+  const d = new Date();
+  return `${localDateStr(d)} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+function cutoffFor(date: string, session: Session): string {
+  return session === 'Morning' ? `${addDays(date, -1)} 21:00` : `${date} 12:00`;
+}
+
+function openSlots(): { date: string; session: Session; cutoff: string }[] {
+  const now = nowStamp();
+  const today = now.slice(0, 10);
+  const tomorrow = addDays(today, 1);
+  const horizon = `${tomorrow} ${now.slice(11)}`;
+  const horizonEnd = horizon < `${tomorrow} 12:00` ? `${tomorrow} 12:00` : horizon;
+  const out: { date: string; session: Session; cutoff: string }[] = [];
+  [0, 1, 2].forEach((offset) => {
+    const date = addDays(today, offset);
+    (['Morning', 'Evening'] as Session[]).forEach((session) => {
+      const cutoff = cutoffFor(date, session);
+      if (cutoff > now && cutoff <= horizonEnd) out.push({ date, session, cutoff });
+    });
+  });
+  return out;
+}
+
+function shopHome(shop: Shop): ShopHome {
+  const route = routes.find((r) => r.RouteId === shop.RouteId);
+  const mine = indents.filter((o) => o.shopId === shop.ShopId);
+  const slots: ShopSlot[] = openSlots().map((slot) => ({
+    ...slot,
+    order: mine.find((o) => o.date === slot.date && o.session === slot.session) ?? null,
+  }));
+  const firstOpen = slots.length ? `${slots[0].date} ${slots[0].session}` : '9999';
+  const lastOrder =
+    mine
+      .filter((o) => o.items.length && `${o.date} ${o.session}` < firstOpen)
+      .sort((a, b) => (b.date + b.session).localeCompare(a.date + a.session))[0] ?? null;
+  return {
+    shop: { name: shop.Name, ownerName: shop.OwnerName, routeName: route?.Name ?? '' },
+    products: products
+      .filter((p) => p.Active !== false)
+      .map((p) => ({ ProductId: p.ProductId, Name: p.Name, Unit: p.Unit, Price: p.Price })),
+    slots,
+    lastOrder,
+    now: nowStamp(),
+  };
+}
+
+export async function shopCall(
+  creds: { phone: string; pin: string },
+  action: string,
+  payload: Record<string, unknown>,
+): Promise<ShopHome> {
+  const shop = shops.find((s) => s.Phone === normalizePhone(creds.phone) && s.Active);
+  if (!shop || shop.pin !== creds.pin) throw new Error('Incorrect phone number or PIN.');
+  if (action === 'shopLogin') return shopHome(shop);
+  if (action !== 'shopSaveOrder') throw new Error('Unauthorized');
+
+  const { date, session } = payload as { date: string; session: Session };
+  if (!openSlots().some((s) => s.date === date && s.session === session)) throw new Error('Ordering for this delivery has closed.');
+  const items = ((payload.items as { productId: string; qty: number }[]) || []).filter((i) => Number(i.qty) > 0);
+  const total = items.reduce((sum, i) => sum + i.qty * (products.find((p) => p.ProductId === i.productId)?.Price ?? 0), 0);
+  const existing = indents.find((o) => o.shopId === shop.ShopId && o.date === date && o.session === session);
+  const updatedAt = nowStamp();
+  if (existing) Object.assign(existing, { items, total, updatedAt });
+  else indents.push({ indentId: newId('I'), date, session, shopId: shop.ShopId, routeId: shop.RouteId, items, total, updatedAt });
+  return shopHome(shop);
+}
+
+export async function getDashboard(date: string): Promise<DashboardData> {
+  const orders: DashboardData['orders'] = [];
+  shops
+    .filter((s) => s.Active)
+    .forEach((s) => {
+      (['Morning', 'Evening'] as Session[]).forEach((session) => {
+        let row = orders.find((o) => o.routeId === s.RouteId && o.session === session);
+        if (!row) orders.push((row = { routeId: s.RouteId, session, shops: 0, ordered: 0 }));
+        row.shops += 1;
+        if (indents.some((o) => o.shopId === s.ShopId && o.date === date && o.session === session && o.items.length)) row.ordered += 1;
+      });
+    });
+  return { trips: await getTodayStatus(date), orders };
 }

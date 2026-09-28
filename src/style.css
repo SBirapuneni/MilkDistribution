@@ -585,3 +585,82 @@ table.line-items tfoot td {
     gap: 0.5rem;
   }
 }
+
+/* ---- Shop owners & shop orders ---- */
+.stacked-form {
+  flex-direction: column;
+  width: 100%;
+  max-width: 320px;
+}
+.stacked-form input,
+.stacked-form button {
+  width: 100%;
+}
+.small-link {
+  font-size: 0.85rem;
+  color: var(--color-primary);
+  text-decoration: none;
+}
+.shop-page {
+  max-width: 720px;
+}
+.shop-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+.shop-header h1 {
+  margin-bottom: 0.1rem;
+}
+.shop-header p {
+  margin-top: 0;
+}
+.slot-tabs {
+  flex-wrap: wrap;
+}
+.slot-tabs .session-tab.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+}
+.cutoff {
+  font-size: 0.9rem;
+  color: var(--color-secondary-text);
+}
+.pin-callout .pin {
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.35rem;
+}
+.button-link {
+  display: inline-block;
+  background: #1f9d55;
+  color: white;
+  text-decoration: none;
+  padding: 0.6rem 1.2rem;
+  border-radius: 6px;
+  font-weight: 600;
+}
+.button-link:hover {
+  background: #17803f;
+}
+.shop-orders {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+.shop-orders summary {
+  cursor: pointer;
+}
+.shop-orders .table-scroll {
+  margin: 0.75rem 0 0.25rem;
+}
+.order-counts {
+  font-size: 0.8rem;
+  color: var(--color-secondary-text);
+  margin: -0.25rem 0 0.5rem;
+}

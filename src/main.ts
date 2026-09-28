@@ -7,10 +7,19 @@ import { renderProducts } from './screens/products';
 import { renderRoutesAdmin } from './screens/routes-admin';
 import { renderHistory } from './screens/history';
 import { renderAnalytics } from './screens/analytics';
+import { renderShopPortal } from './screens/shop-order';
+import { renderShopsAdmin } from './screens/shops-admin';
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 function render() {
+  // The shop owners' order page has its own phone + PIN login and never
+  // needs (or reveals) the staff passcode.
+  if (window.location.hash.startsWith('#/order')) {
+    renderShopPortal(app);
+    return;
+  }
+
   if (!getToken() || !getUserName()) {
     renderPasscode(app, render);
     return;
@@ -30,6 +39,8 @@ function render() {
     renderProducts(app);
   } else if (path === 'routes') {
     renderRoutesAdmin(app);
+  } else if (path === 'shops') {
+    renderShopsAdmin(app);
   } else if (path === 'history') {
     renderHistory(app);
   } else if (path === 'analytics') {

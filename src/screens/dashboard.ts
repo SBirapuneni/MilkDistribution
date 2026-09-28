@@ -1,6 +1,6 @@
 import { navHtml, wireNav } from '../components/nav';
-import { getMasterData, getTodayStatus } from '../api';
-import type { Route, Session, Trip } from '../types';
+import { getDashboard, getMasterData } from '../api';
+import type { DashboardData, Route, Session, Trip } from '../types';
 import { escapeHtml, localDateStr, money, moneyRound } from '../util';
 
 export async function renderDashboard(container: HTMLElement) {
@@ -13,7 +13,7 @@ export async function renderDashboard(container: HTMLElement) {
   const summaryEl = container.querySelector<HTMLDivElement>('#day-summary')!;
 
   try {
-    const [{ routes }, todayTrips] = await Promise.all([getMasterData(), getTodayStatus(localDateStr())]);
+    const [{ routes }, { trips: todayTrips, orders }] = await Promise.all([getMasterData(), getDashboard(localDateStr())]);
     const activeRoutes = routes.filter((r) => r.Active !== false && String(r.Active).toUpperCase() !== 'FALSE');
 
     const tripByKey = new Map<string, Trip>();
@@ -27,6 +27,7 @@ export async function renderDashboard(container: HTMLElement) {
               route,
               tripByKey.get(`${route.RouteId}|Morning`) ?? null,
               tripByKey.get(`${route.RouteId}|Evening`) ?? null,
+              orders.filter((o) => o.routeId === route.RouteId),
             ),
           )
           .join('')
@@ -73,11 +74,21 @@ function sessionBadge(route: Route, session: Session, trip: Trip | null): string
   return `<a class="session-badge ${cls}" href="${href}"><strong>${session}:</strong> <span>${label}</span></a>`;
 }
 
-function renderCard(route: Route, morning: Trip | null, evening: Trip | null): string {
+function renderOrderCounts(orders: DashboardData['orders']): string {
+  if (orders.length === 0 || orders.every((o) => o.shops === 0)) return '';
+  const part = (session: Session) => {
+    const o = orders.find((x) => x.session === session);
+    return o ? `${session} <strong class="${o.ordered < o.shops ? 'pending' : ''}">${o.ordered}/${o.shops}</strong>` : '';
+  };
+  return `<p class="order-counts">Shop orders today · ${part('Morning')} · ${part('Evening')}</p>`;
+}
+
+function renderCard(route: Route, morning: Trip | null, evening: Trip | null, orders: DashboardData['orders']): string {
   return `
     <div class="route-card">
       <h2><a href="#/route/${encodeURIComponent(route.RouteId)}">${escapeHtml(route.Name)}</a></h2>
       <p class="villages">${escapeHtml(route.Villages)}</p>
+      ${renderOrderCounts(orders)}
       <div class="session-status">
         ${sessionBadge(route, 'Morning', morning)}
         ${sessionBadge(route, 'Evening', evening)}

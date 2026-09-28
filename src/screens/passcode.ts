@@ -11,6 +11,7 @@ export function renderPasscode(container: HTMLElement, onSuccess: () => void) {
         <button type="submit">Enter</button>
       </form>
       <p id="passcode-error" class="error"></p>
+      <a href="#/order" class="small-link">Shop owner? Place your order here &rarr;</a>
       ${DEMO_MODE ? `<p class="hint">Demo mode — no Google Sheet connected. Passcode is "${DEMO_PASSCODE}" (admin passcode for reopening trips: "${DEMO_ADMIN_PASSCODE}"). Data resets on reload.</p>` : ''}
     </div>
   `;
