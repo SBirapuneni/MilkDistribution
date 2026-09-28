@@ -43,6 +43,10 @@ export interface Trip {
   Discrepancy: number | '';
   CreatedAt: string;
   SettledAt: string;
+  DispatchedBy?: string;
+  SettledBy?: string;
+  ReopenedBy?: string;
+  ReopenedAt?: string;
   RouteName?: string;
 }
 
@@ -62,6 +66,8 @@ export interface AnalyticsSummary {
   totalRevenue: number;
   totalCash: number;
   totalDiscrepancy: number;
+  totalShortage: number;
+  totalExcess: number;
   tripCount: number;
 }
 
@@ -69,7 +75,9 @@ export interface AnalyticsByDate {
   date: string;
   dispatched: number;
   returned: number;
+  cash: number;
   discrepancy: number;
+  shortage: number;
   tripCount: number;
   revenue: number;
 }
@@ -80,8 +88,19 @@ export interface AnalyticsByRoute {
   dispatched: number;
   returned: number;
   discrepancy: number;
+  shortage: number;
+  excess: number;
   tripCount: number;
   revenue: number;
+}
+
+export interface AnalyticsByDriver {
+  driver: string;
+  tripCount: number;
+  shortTrips: number;
+  shortage: number;
+  excess: number;
+  discrepancy: number;
 }
 
 export interface AnalyticsBySession {
@@ -107,6 +126,7 @@ export interface Analytics {
   summary: AnalyticsSummary;
   byDate: AnalyticsByDate[];
   byRoute: AnalyticsByRoute[];
+  byDriver: AnalyticsByDriver[];
   bySession: AnalyticsBySession[];
   byProduct: AnalyticsByProduct[];
 }

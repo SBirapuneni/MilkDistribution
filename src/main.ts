@@ -1,5 +1,5 @@
 import './style.css';
-import { getToken } from './api';
+import { getToken, getUserName } from './api';
 import { renderPasscode } from './screens/passcode';
 import { renderDashboard } from './screens/dashboard';
 import { renderRouteScreen } from './screens/route';
@@ -11,7 +11,7 @@ import { renderAnalytics } from './screens/analytics';
 const app = document.querySelector<HTMLDivElement>('#app')!;
 
 function render() {
-  if (!getToken()) {
+  if (!getToken() || !getUserName()) {
     renderPasscode(app, render);
     return;
   }
@@ -24,7 +24,8 @@ function render() {
   if (path === '') {
     renderDashboard(app);
   } else if (path === 'route' && param) {
-    renderRouteScreen(app, decodeURIComponent(param));
+    const session = parts[3] === 'Morning' || parts[3] === 'Evening' ? parts[3] : undefined;
+    renderRouteScreen(app, decodeURIComponent(param), session);
   } else if (path === 'products') {
     renderProducts(app);
   } else if (path === 'routes') {

@@ -12,23 +12,50 @@ const SHEET_NAMES = {
   TRIP_ITEMS: 'TripItems',
 };
 
-// ---- One-time setup -------------------------------------------------
-
-function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  createSheetIfMissing_(ss, SHEET_NAMES.PRODUCTS, ['ProductId', 'Name', 'Unit', 'Price', 'Active']);
-  createSheetIfMissing_(ss, SHEET_NAMES.ROUTES, ['RouteId', 'Name', 'Villages', 'DefaultVehicle', 'DefaultDriver', 'Active']);
-  createSheetIfMissing_(ss, SHEET_NAMES.TRIPS, [
+const HEADERS = {
+  PRODUCTS: ['ProductId', 'Name', 'Unit', 'Price', 'Active'],
+  ROUTES: ['RouteId', 'Name', 'Villages', 'DefaultVehicle', 'DefaultDriver', 'Active'],
+  TRIPS: [
     'TripId', 'Date', 'Session', 'RouteId', 'Driver', 'Vehicle', 'Status',
     'DispatchedTotal', 'ReturnedTotal', 'AmountDue', 'CashHandedOver', 'Discrepancy',
-    'CreatedAt', 'SettledAt',
-  ]);
-  createSheetIfMissing_(ss, SHEET_NAMES.TRIP_ITEMS, [
+    'CreatedAt', 'SettledAt', 'DispatchedBy', 'SettledBy', 'ReopenedBy', 'ReopenedAt',
+  ],
+  TRIP_ITEMS: [
     'TripItemId', 'TripId', 'ProductId', 'Price', 'QtyDispatched', 'QtyReturned', 'DispatchedValue', 'ReturnedValue',
-  ]);
+  ],
+};
+
+const MIN_PASSCODE_LENGTH = 12;
+
+// Global (not per-client — Apps Script can't see caller IPs) brute-force
+// throttle: once this many wrong passcodes arrive within the window, every
+// request is refused until the window passes. High enough that staff typos
+// never trip it, low enough to make guessing a 12+ character passcode hopeless.
+const MAX_FAILED_AUTH = 100;
+const FAILED_AUTH_WINDOW_SECONDS = 600;
+
+const WRITE_ACTIONS = {
+  saveProduct: true,
+  saveRoute: true,
+  dispatchTrip: true,
+  saveTripProgress: true,
+  settleTrip: true,
+  reopenTrip: true,
+};
+
+// ---- One-time setup -------------------------------------------------
+
+// Safe to re-run: creates missing tabs and appends any missing header
+// columns (e.g. after upgrading this script) without touching existing data.
+function setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureSheet_(ss, SHEET_NAMES.PRODUCTS, HEADERS.PRODUCTS);
+  ensureSheet_(ss, SHEET_NAMES.ROUTES, HEADERS.ROUTES);
+  ensureSheet_(ss, SHEET_NAMES.TRIPS, HEADERS.TRIPS);
+  ensureSheet_(ss, SHEET_NAMES.TRIP_ITEMS, HEADERS.TRIP_ITEMS);
 }
 
-function createSheetIfMissing_(ss, name, headers) {
+function ensureSheet_(ss, name, headers) {
   let sheet = ss.getSheetByName(name);
   if (!sheet) {
     sheet = ss.insertSheet(name);
@@ -36,6 +63,12 @@ function createSheetIfMissing_(ss, name, headers) {
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
+    return;
+  }
+  const existing = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const missing = headers.filter((h) => existing.indexOf(h) === -1);
+  if (missing.length > 0) {
+    sheet.getRange(1, existing.length + 1, 1, missing.length).setValues([missing]);
   }
 }
 
@@ -43,7 +76,20 @@ function createSheetIfMissing_(ss, name, headers) {
 // your shared passcode. It never needs to be committed to source control.
 function setAppToken() {
   const token = 'REPLACE_WITH_YOUR_PASSCODE';
+  if (token === 'REPLACE_WITH_YOUR_PASSCODE' || token.length < MIN_PASSCODE_LENGTH) {
+    throw new Error('Pick a passcode of at least ' + MIN_PASSCODE_LENGTH + ' characters (a few words works well).');
+  }
   PropertiesService.getScriptProperties().setProperty('APP_TOKEN', token);
+}
+
+// Separate passcode, known only to the owner, required to reopen a settled
+// trip. Reopening stays disabled until this has been run.
+function setAdminToken() {
+  const token = 'REPLACE_WITH_YOUR_ADMIN_PASSCODE';
+  if (token === 'REPLACE_WITH_YOUR_ADMIN_PASSCODE' || token.length < MIN_PASSCODE_LENGTH) {
+    throw new Error('Pick an admin passcode of at least ' + MIN_PASSCODE_LENGTH + ' characters.');
+  }
+  PropertiesService.getScriptProperties().setProperty('ADMIN_TOKEN', token);
 }
 
 // ---- HTTP entry points -----------------------------------------------
@@ -56,23 +102,22 @@ function doPost(e) {
   let response;
   try {
     const body = JSON.parse(e.postData.contents);
-    const token = body.token;
     const action = body.action;
     const payload = body.payload || {};
+    const ctx = { user: String(body.user || '').trim().slice(0, 50) };
 
-    const expectedToken = PropertiesService.getScriptProperties().getProperty('APP_TOKEN');
-    if (!expectedToken || token !== expectedToken) {
-      throw new Error('Unauthorized');
-    }
+    checkAppToken_(body.token);
 
     const handlers = {
       getMasterData: getMasterData,
       saveProduct: saveProduct,
       saveRoute: saveRoute,
       getTrip: getTrip,
+      getLastTrip: getLastTrip,
       dispatchTrip: dispatchTrip,
       saveTripProgress: saveTripProgress,
       settleTrip: settleTrip,
+      reopenTrip: reopenTrip,
       listTrips: listTrips,
       getTodayStatus: getTodayStatus,
       getAnalytics: getAnalytics,
@@ -82,13 +127,56 @@ function doPost(e) {
       throw new Error('Unknown action: ' + action);
     }
 
-    response = { ok: true, data: handlers[action](payload) };
+    if (WRITE_ACTIONS[action]) {
+      if (!ctx.user) throw new Error('Your name is required. Log out and log back in with your name.');
+      // Serialize writes: without this, two phones dispatching the same route
+      // at once can both pass the "trip already exists" check.
+      const lock = LockService.getScriptLock();
+      if (!lock.tryLock(30000)) throw new Error('Server busy, please try again.');
+      try {
+        response = { ok: true, data: handlers[action](payload, ctx) };
+        SpreadsheetApp.flush();
+      } finally {
+        lock.releaseLock();
+      }
+    } else {
+      response = { ok: true, data: handlers[action](payload, ctx) };
+    }
   } catch (err) {
     response = { ok: false, error: err.message };
   }
 
   return ContentService.createTextOutput(JSON.stringify(response))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---- Auth ------------------------------------------------------------
+
+function checkAppToken_(token) {
+  const cache = CacheService.getScriptCache();
+  const failures = Number(cache.get('failedAuth') || 0);
+  if (failures >= MAX_FAILED_AUTH) {
+    throw new Error('Too many failed passcode attempts. Try again in 10 minutes.');
+  }
+  const expected = PropertiesService.getScriptProperties().getProperty('APP_TOKEN');
+  if (!expected || token !== expected) {
+    recordAuthFailure_(cache, failures);
+    throw new Error('Unauthorized');
+  }
+}
+
+function checkAdminToken_(token) {
+  const expected = PropertiesService.getScriptProperties().getProperty('ADMIN_TOKEN');
+  if (!expected) throw new Error('Reopening is disabled: no admin passcode set. Run setAdminToken() in Apps Script.');
+  if (token !== expected) {
+    const cache = CacheService.getScriptCache();
+    recordAuthFailure_(cache, Number(cache.get('failedAuth') || 0));
+    throw new Error('Incorrect admin passcode');
+  }
+}
+
+function recordAuthFailure_(cache, failures) {
+  cache.put('failedAuth', String(failures + 1), FAILED_AUTH_WINDOW_SECONDS);
 }
 
 // ---- Sheet helpers -----------------------------------------------------
@@ -124,11 +212,15 @@ function appendObject_(sheetName, obj) {
   sheet.appendRow(row);
 }
 
+// Only the keys present in obj are changed; every other column keeps its
+// current value.
 function updateObjectByRow_(sheetName, rowNumber, obj) {
   const sheet = getSheet_(sheetName);
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const row = headers.map((h) => (obj[h] !== undefined ? obj[h] : ''));
-  sheet.getRange(rowNumber, 1, 1, row.length).setValues([row]);
+  const range = sheet.getRange(rowNumber, 1, 1, headers.length);
+  const existing = range.getValues()[0];
+  const row = headers.map((h, j) => (obj[h] !== undefined ? obj[h] : existing[j]));
+  range.setValues([row]);
 }
 
 function stripRow_(obj) {
@@ -143,9 +235,17 @@ function newId_(prefix) {
   return prefix + new Date().getTime() + Math.floor(Math.random() * 1000);
 }
 
+let spreadsheetTimeZone_ = null;
+
+// Sheets turns a 'yyyy-MM-dd' string into a Date at midnight in the
+// *spreadsheet's* timezone, so it must be formatted back in that same
+// timezone (not the script's) or dates can shift by a day.
 function formatDate_(d) {
   if (Object.prototype.toString.call(d) === '[object Date]') {
-    return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    if (!spreadsheetTimeZone_) {
+      spreadsheetTimeZone_ = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone();
+    }
+    return Utilities.formatDate(d, spreadsheetTimeZone_, 'yyyy-MM-dd');
   }
   return String(d);
 }
@@ -177,7 +277,7 @@ function saveProduct(payload) {
     const existing = products.filter((p) => p.ProductId === payload.productId)[0];
     if (!existing) throw new Error('Product not found');
     updateObjectByRow_(SHEET_NAMES.PRODUCTS, existing.__row, {
-      ProductId: existing.ProductId, Name: name, Unit: unit, Price: price, Active: active,
+      Name: name, Unit: unit, Price: price, Active: active,
     });
     return { productId: existing.ProductId };
   }
@@ -203,7 +303,7 @@ function saveRoute(payload) {
     const routes = readAll_(SHEET_NAMES.ROUTES);
     const existing = routes.filter((r) => r.RouteId === payload.routeId)[0];
     if (!existing) throw new Error('Route not found');
-    updateObjectByRow_(SHEET_NAMES.ROUTES, existing.__row, Object.assign({ RouteId: existing.RouteId }, fields));
+    updateObjectByRow_(SHEET_NAMES.ROUTES, existing.__row, fields);
     return { routeId: existing.RouteId };
   }
 
@@ -227,9 +327,12 @@ function getTrip(payload) {
   return { trip: strippedTrip, items: items.map(stripRow_) };
 }
 
-function dispatchTrip(payload) {
+function dispatchTrip(payload, ctx) {
   if (payload.session !== 'Morning' && payload.session !== 'Evening') {
     throw new Error('Session must be Morning or Evening');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(payload.date))) {
+    throw new Error('Date must be in yyyy-MM-dd format');
   }
   const existing = getTrip({ routeId: payload.routeId, date: payload.date, session: payload.session });
   if (existing) throw new Error('This route already has a ' + payload.session + ' trip for ' + payload.date);
@@ -279,6 +382,7 @@ function dispatchTrip(payload) {
     Discrepancy: '',
     CreatedAt: new Date(),
     SettledAt: '',
+    DispatchedBy: ctx.user,
   });
 
   itemsToWrite.forEach((item) => appendObject_(SHEET_NAMES.TRIP_ITEMS, item));
@@ -286,27 +390,28 @@ function dispatchTrip(payload) {
   return getTrip({ routeId: payload.routeId, date: payload.date, session: payload.session });
 }
 
-function applyReturns_(trip, payload, finalize) {
+function applyReturns_(trip, payload, finalize, ctx) {
   const tripItems = readAll_(SHEET_NAMES.TRIP_ITEMS).filter((i) => i.TripId === trip.TripId);
   const returnMap = {};
   (payload.items || []).forEach((i) => { returnMap[i.productId] = Number(i.qtyReturned) || 0; });
 
-  let returnedTotal = 0;
+  // Validate everything before writing anything, so a bad row can't leave
+  // the trip half-updated.
   tripItems.forEach((item) => {
     const qtyReturned = returnMap[item.ProductId] || 0;
+    if (qtyReturned < 0) throw new Error('Returned qty cannot be negative for product ' + item.ProductId);
     if (qtyReturned > Number(item.QtyDispatched)) {
       throw new Error('Returned qty exceeds dispatched qty for product ' + item.ProductId);
     }
+  });
+
+  let returnedTotal = 0;
+  tripItems.forEach((item) => {
+    const qtyReturned = returnMap[item.ProductId] || 0;
     const returnedValue = qtyReturned * Number(item.Price);
     returnedTotal += returnedValue;
     updateObjectByRow_(SHEET_NAMES.TRIP_ITEMS, item.__row, {
-      TripItemId: item.TripItemId,
-      TripId: item.TripId,
-      ProductId: item.ProductId,
-      Price: item.Price,
-      QtyDispatched: item.QtyDispatched,
       QtyReturned: qtyReturned,
-      DispatchedValue: item.DispatchedValue,
       ReturnedValue: returnedValue,
     });
   });
@@ -317,39 +422,66 @@ function applyReturns_(trip, payload, finalize) {
   const discrepancy = cashHandedOver - amountDue;
 
   updateObjectByRow_(SHEET_NAMES.TRIPS, trip.__row, {
-    TripId: trip.TripId,
-    Date: trip.Date,
-    Session: trip.Session,
-    RouteId: trip.RouteId,
-    Driver: trip.Driver,
-    Vehicle: trip.Vehicle,
     Status: finalize ? 'Settled' : 'Dispatched',
-    DispatchedTotal: dispatchedTotal,
     ReturnedTotal: returnedTotal,
     AmountDue: amountDue,
     CashHandedOver: cashHandedOver,
     Discrepancy: discrepancy,
-    CreatedAt: trip.CreatedAt,
     SettledAt: finalize ? new Date() : '',
+    SettledBy: finalize ? ctx.user : '',
   });
 
   return getTrip({ routeId: trip.RouteId, date: formatDate_(trip.Date), session: trip.Session });
 }
 
-function saveTripProgress(payload) {
-  const trips = readAll_(SHEET_NAMES.TRIPS);
-  const trip = trips.filter((t) => t.TripId === payload.tripId)[0];
+function findTrip_(tripId) {
+  const trip = readAll_(SHEET_NAMES.TRIPS).filter((t) => t.TripId === tripId)[0];
   if (!trip) throw new Error('Trip not found');
-  if (trip.Status === 'Settled') throw new Error('Trip already settled');
-  return applyReturns_(trip, payload, false);
+  return trip;
 }
 
-function settleTrip(payload) {
-  const trips = readAll_(SHEET_NAMES.TRIPS);
-  const trip = trips.filter((t) => t.TripId === payload.tripId)[0];
-  if (!trip) throw new Error('Trip not found');
+function saveTripProgress(payload, ctx) {
+  const trip = findTrip_(payload.tripId);
   if (trip.Status === 'Settled') throw new Error('Trip already settled');
-  return applyReturns_(trip, payload, true);
+  return applyReturns_(trip, payload, false, ctx);
+}
+
+function settleTrip(payload, ctx) {
+  const trip = findTrip_(payload.tripId);
+  if (trip.Status === 'Settled') throw new Error('Trip already settled');
+  return applyReturns_(trip, payload, true, ctx);
+}
+
+// Puts a settled trip back to Dispatched (keeping its return quantities and
+// cash) so a mistake can be corrected and the trip settled again.
+function reopenTrip(payload, ctx) {
+  checkAdminToken_(payload.adminToken);
+  const trip = findTrip_(payload.tripId);
+  if (trip.Status !== 'Settled') throw new Error('Trip is not settled');
+  updateObjectByRow_(SHEET_NAMES.TRIPS, trip.__row, {
+    Status: 'Dispatched',
+    SettledAt: '',
+    SettledBy: '',
+    ReopenedBy: ctx.user,
+    ReopenedAt: new Date(),
+  });
+  return getTrip({ routeId: trip.RouteId, date: formatDate_(trip.Date), session: trip.Session });
+}
+
+// The most recent earlier trip for this route and session — used to pre-fill
+// the dispatch form, since quantities barely change day to day.
+function getLastTrip(payload) {
+  const before = String(payload.beforeDate || '');
+  const candidates = readAll_(SHEET_NAMES.TRIPS).filter(
+    (t) => t.RouteId === payload.routeId && t.Session === payload.session && formatDate_(t.Date) < before,
+  );
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => formatDate_(b.Date).localeCompare(formatDate_(a.Date)));
+  const trip = candidates[0];
+  const items = readAll_(SHEET_NAMES.TRIP_ITEMS).filter((i) => i.TripId === trip.TripId);
+  const strippedTrip = stripRow_(trip);
+  strippedTrip.Date = formatDate_(trip.Date);
+  return { trip: strippedTrip, items: items.map(stripRow_) };
 }
 
 function listTrips(payload) {
@@ -392,6 +524,10 @@ function getTodayStatus(payload) {
 // Only settled trips are counted: DispatchedTotal/ReturnedTotal/etc. on a
 // still-open trip aren't final, so they'd distort revenue and return-rate
 // numbers used for business decisions.
+//
+// Discrepancies are reported as shortage (cash short, a positive number) and
+// excess separately, never just netted: one driver ₹500 short and another
+// ₹500 over must not show up as ₹0.
 
 function getAnalytics(payload) {
   const trips = readAll_(SHEET_NAMES.TRIPS).filter((t) => t.Status === 'Settled');
@@ -418,9 +554,12 @@ function getAnalytics(payload) {
   let totalReturned = 0;
   let totalCash = 0;
   let totalDiscrepancy = 0;
+  let totalShortage = 0;
+  let totalExcess = 0;
 
   const byDateMap = {};
   const byRouteMap = {};
+  const byDriverMap = {};
   const bySessionMap = {
     Morning: { session: 'Morning', dispatched: 0, returned: 0, tripCount: 0 },
     Evening: { session: 'Evening', dispatched: 0, returned: 0, tripCount: 0 },
@@ -431,17 +570,23 @@ function getAnalytics(payload) {
     const returned = Number(t.ReturnedTotal) || 0;
     const discrepancy = Number(t.Discrepancy) || 0;
     const cash = Number(t.CashHandedOver) || 0;
+    const shortage = discrepancy < 0 ? -discrepancy : 0;
+    const excess = discrepancy > 0 ? discrepancy : 0;
 
     totalDispatched += dispatched;
     totalReturned += returned;
     totalCash += cash;
     totalDiscrepancy += discrepancy;
+    totalShortage += shortage;
+    totalExcess += excess;
 
     const d = formatDate_(t.Date);
-    if (!byDateMap[d]) byDateMap[d] = { date: d, dispatched: 0, returned: 0, discrepancy: 0, tripCount: 0 };
+    if (!byDateMap[d]) byDateMap[d] = { date: d, dispatched: 0, returned: 0, cash: 0, discrepancy: 0, shortage: 0, tripCount: 0 };
     byDateMap[d].dispatched += dispatched;
     byDateMap[d].returned += returned;
     byDateMap[d].discrepancy += discrepancy;
+    byDateMap[d].shortage += shortage;
+    byDateMap[d].cash += cash;
     byDateMap[d].tripCount += 1;
 
     if (!byRouteMap[t.RouteId]) {
@@ -451,13 +596,29 @@ function getAnalytics(payload) {
         dispatched: 0,
         returned: 0,
         discrepancy: 0,
+        shortage: 0,
+        excess: 0,
         tripCount: 0,
       };
     }
-    byRouteMap[t.RouteId].dispatched += dispatched;
-    byRouteMap[t.RouteId].returned += returned;
-    byRouteMap[t.RouteId].discrepancy += discrepancy;
-    byRouteMap[t.RouteId].tripCount += 1;
+    const r = byRouteMap[t.RouteId];
+    r.dispatched += dispatched;
+    r.returned += returned;
+    r.discrepancy += discrepancy;
+    r.shortage += shortage;
+    r.excess += excess;
+    r.tripCount += 1;
+
+    const driver = String(t.Driver || '').trim() || '(no driver)';
+    if (!byDriverMap[driver]) {
+      byDriverMap[driver] = { driver: driver, tripCount: 0, shortTrips: 0, shortage: 0, excess: 0, discrepancy: 0 };
+    }
+    const dr = byDriverMap[driver];
+    dr.tripCount += 1;
+    if (shortage > 0) dr.shortTrips += 1;
+    dr.shortage += shortage;
+    dr.excess += excess;
+    dr.discrepancy += discrepancy;
 
     if (bySessionMap[t.Session]) {
       bySessionMap[t.Session].dispatched += dispatched;
@@ -495,6 +656,10 @@ function getAnalytics(payload) {
     .map((r) => Object.assign({ revenue: r.dispatched - r.returned }, r))
     .sort((a, b) => b.revenue - a.revenue);
 
+  const byDriver = Object.keys(byDriverMap)
+    .map((k) => byDriverMap[k])
+    .sort((a, b) => b.shortage - a.shortage || b.excess - a.excess);
+
   const bySession = Object.keys(bySessionMap)
     .map((k) => bySessionMap[k])
     .map((r) => Object.assign({ revenue: r.dispatched - r.returned }, r));
@@ -519,10 +684,13 @@ function getAnalytics(payload) {
       totalRevenue: totalDispatched - totalReturned,
       totalCash: totalCash,
       totalDiscrepancy: totalDiscrepancy,
+      totalShortage: totalShortage,
+      totalExcess: totalExcess,
       tripCount: filtered.length,
     },
     byDate: byDate,
     byRoute: byRoute,
+    byDriver: byDriver,
     bySession: bySession,
     byProduct: byProduct,
   };

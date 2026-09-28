@@ -1,6 +1,7 @@
 import { navHtml, wireNav } from '../components/nav';
 import { getMasterData, saveProduct } from '../api';
 import type { Product } from '../types';
+import { escapeHtml, money } from '../util';
 
 export async function renderProducts(container: HTMLElement) {
   container.innerHTML = navHtml('products') + '<main class="page"><h1>Products</h1><div id="content">Loading...</div></main>';
@@ -16,7 +17,7 @@ export async function renderProducts(container: HTMLElement) {
       wireList(products);
       wireForm();
     } catch (err) {
-      content.innerHTML = `<p class="error">Failed to load: ${(err as Error).message}</p>`;
+      content.innerHTML = `<p class="error">Failed to load: ${escapeHtml((err as Error).message)}</p>`;
     }
   }
 
@@ -30,11 +31,11 @@ export async function renderProducts(container: HTMLElement) {
             .map(
               (p) => `
             <tr>
-              <td>${p.Name}</td>
-              <td>${p.Unit}</td>
-              <td>₹${p.Price}</td>
+              <td>${escapeHtml(p.Name)}</td>
+              <td>${escapeHtml(p.Unit)}</td>
+              <td>${money(p.Price)}</td>
               <td>${isActive(p.Active) ? 'Yes' : 'No'}</td>
-              <td><button class="edit-btn" type="button" data-id="${p.ProductId}">Edit</button></td>
+              <td><button class="edit-btn" type="button" data-id="${escapeHtml(p.ProductId)}">Edit</button></td>
             </tr>
           `,
             )
@@ -48,12 +49,12 @@ export async function renderProducts(container: HTMLElement) {
     return `
       <h2>${editing ? 'Edit product' : 'Add product'}</h2>
       <form id="product-form">
-        <input type="hidden" name="productId" value="${editing?.ProductId ?? ''}" />
+        <input type="hidden" name="productId" value="${escapeHtml(editing?.ProductId)}" />
         <div class="field-row">
-          <label>Name <input type="text" name="name" value="${editing?.Name ?? ''}" required /></label>
-          <label>Unit <input type="text" name="unit" placeholder="e.g. litre, packet" value="${editing?.Unit ?? ''}" required /></label>
-          <label>Price <input type="number" name="price" min="0" step="0.01" value="${editing?.Price ?? ''}" required /></label>
-          <label><input type="checkbox" name="active" ${editing?.Active === false ? '' : 'checked'} /> Active</label>
+          <label>Name <input type="text" name="name" value="${escapeHtml(editing?.Name)}" required /></label>
+          <label>Unit <input type="text" name="unit" placeholder="e.g. litre, packet" value="${escapeHtml(editing?.Unit)}" required /></label>
+          <label>Price <input type="number" name="price" min="0" step="0.01" value="${escapeHtml(editing?.Price)}" required /></label>
+          <label><input type="checkbox" name="active" ${editing && !isActive(editing.Active) ? '' : 'checked'} /> Active</label>
         </div>
         <button type="submit">Save</button>
         <p id="product-error" class="error"></p>

@@ -3,12 +3,14 @@ import * as mock from './mock';
 
 const API_URL = import.meta.env.VITE_API_URL;
 const TOKEN_KEY = 'milk_app_token';
+const USER_KEY = 'milk_app_user';
 
 // With no Apps Script URL configured, fall back to an in-memory demo backend
 // so the UI can be tried out before the Google Sheet is set up. Demo data
 // resets on page reload.
 export const DEMO_MODE = !API_URL;
 export const DEMO_PASSCODE = 'demo';
+export const DEMO_ADMIN_PASSCODE = mock.DEMO_ADMIN_PASSCODE;
 
 export function getToken(): string | null {
   return sessionStorage.getItem(TOKEN_KEY);
@@ -22,13 +24,35 @@ export function clearToken() {
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
+// Who is using this device. Sent with every request and recorded on the trip
+// (DispatchedBy / SettledBy / ReopenedBy), since the passcode is shared.
+// Kept in localStorage so staff don't retype it every login.
+export function getUserName(): string {
+  try {
+    return localStorage.getItem(USER_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setUserName(name: string) {
+  try {
+    localStorage.setItem(USER_KEY, name);
+  } catch {
+    // Storage blocked (private mode etc.) — the name just won't be remembered.
+  }
+  currentUser = name;
+}
+
+let currentUser = getUserName();
+
 async function rawCall<T>(token: string | null, action: string, payload: Record<string, unknown> = {}): Promise<T> {
   if (!API_URL) throw new Error('VITE_API_URL is not configured');
 
   const res = await fetch(API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ token, action, payload }),
+    body: JSON.stringify({ token, user: currentUser, action, payload }),
   });
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || 'Request failed');
@@ -76,6 +100,10 @@ export function getTrip(routeId: string, date: string, session: Session): Promis
   return DEMO_MODE ? mock.getTrip(routeId, date, session) : call('getTrip', { routeId, date, session });
 }
 
+export function getLastTrip(routeId: string, session: Session, beforeDate: string): Promise<TripWithItems | null> {
+  return DEMO_MODE ? mock.getLastTrip(routeId, session, beforeDate) : call('getLastTrip', { routeId, session, beforeDate });
+}
+
 export function dispatchTrip(payload: {
   routeId: string;
   date: string;
@@ -84,7 +112,7 @@ export function dispatchTrip(payload: {
   vehicle: string;
   items: { productId: string; qty: number }[];
 }): Promise<TripWithItems> {
-  return DEMO_MODE ? mock.dispatchTrip(payload) : call('dispatchTrip', payload);
+  return DEMO_MODE ? mock.dispatchTrip(payload, currentUser) : call('dispatchTrip', payload);
 }
 
 export function saveTripProgress(payload: {
@@ -100,7 +128,11 @@ export function settleTrip(payload: {
   items: { productId: string; qtyReturned: number }[];
   cashHandedOver: number;
 }): Promise<TripWithItems> {
-  return DEMO_MODE ? mock.settleTrip(payload) : call('settleTrip', payload);
+  return DEMO_MODE ? mock.settleTrip(payload, currentUser) : call('settleTrip', payload);
+}
+
+export function reopenTrip(payload: { tripId: string; adminToken: string }): Promise<TripWithItems> {
+  return DEMO_MODE ? mock.reopenTrip(payload, currentUser) : call('reopenTrip', payload);
 }
 
 export function listTrips(

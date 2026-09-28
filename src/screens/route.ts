@@ -1,16 +1,40 @@
 import { navHtml, wireNav } from '../components/nav';
-import { dispatchTrip, getMasterData, getTrip, saveTripProgress, settleTrip } from '../api';
-import type { Product, Route, Session, TripWithItems } from '../types';
+import {
+  dispatchTrip,
+  getLastTrip,
+  getMasterData,
+  getTodayStatus,
+  getTrip,
+  reopenTrip,
+  saveTripProgress,
+  settleTrip,
+} from '../api';
+import type { Product, Route, Session, Trip, TripWithItems } from '../types';
+import { escapeHtml, localDateStr, money, shortDate } from '../util';
 
-function todayStr(): string {
-  return new Date().toISOString().slice(0, 10);
-}
+const SESSIONS: Session[] = ['Morning', 'Evening'];
 
-function defaultSession(): Session {
+function clockSession(): Session {
   return new Date().getHours() < 15 ? 'Morning' : 'Evening';
 }
 
-export async function renderRouteScreen(container: HTMLElement, routeId: string) {
+// Open the session that needs attention rather than going purely by the
+// clock: a Morning trip still awaiting its return at 8 PM must not be hidden
+// behind an empty Evening dispatch form.
+function pickSession(routeTrips: Map<Session, Trip>): Session {
+  const awaiting = SESSIONS.find((s) => routeTrips.get(s)?.Status === 'Dispatched');
+  return awaiting ?? clockSession();
+}
+
+// Tapping a quantity box selects its contents, so typing replaces the value
+// instead of appending to it (no more "05").
+function selectOnFocus(root: HTMLElement) {
+  root.querySelectorAll<HTMLInputElement>('input[type="number"]').forEach((input) =>
+    input.addEventListener('focus', () => input.select()),
+  );
+}
+
+export async function renderRouteScreen(container: HTMLElement, routeId: string, initialSession?: Session) {
   container.innerHTML = navHtml('dashboard') + '<main class="page"><p>Loading...</p></main>';
   wireNav(container);
 
@@ -57,36 +81,63 @@ export async function renderRouteScreen(container: HTMLElement, routeId: string)
       { capture: true },
     );
 
-    async function load(date: string, session: Session) {
-      main.innerHTML = '<p>Loading...</p>';
-      const tripData = await getTrip(routeId, date, session);
-      renderContent(date, session, tripData);
+    async function routeTripsOn(date: string): Promise<Map<Session, Trip>> {
+      const trips = await getTodayStatus(date);
+      return new Map(trips.filter((t) => t.RouteId === routeId).map((t) => [t.Session, t]));
     }
 
-    function renderContent(date: string, session: Session, tripData: TripWithItems | null) {
+    async function load(date: string, session?: Session) {
+      main.innerHTML = '<p>Loading...</p>';
+      const routeTrips = await routeTripsOn(date);
+      const chosen = session ?? pickSession(routeTrips);
+      const tripData = routeTrips.has(chosen) ? await getTrip(routeId, date, chosen) : null;
+      // Keep the session in the URL so a refresh or shared link lands on it.
+      // replaceState doesn't fire hashchange, so this doesn't re-render.
+      history.replaceState(null, '', `#/route/${encodeURIComponent(routeId)}/${chosen}`);
+      renderContent(date, chosen, tripData, routeTrips);
+    }
+
+    function tabStatus(trip: Trip | undefined): string {
+      if (!trip) return '';
+      return trip.Status === 'Settled'
+        ? '<span class="tab-status">Settled</span>'
+        : '<span class="tab-status pending">Awaiting return</span>';
+    }
+
+    function renderContent(date: string, session: Session, tripData: TripWithItems | null, routeTrips: Map<Session, Trip>) {
       pendingSave = null;
+
+      const other = SESSIONS.find((s) => s !== session)!;
+      const otherAwaiting = routeTrips.get(other)?.Status === 'Dispatched';
 
       main.innerHTML = `
         <a href="#/" class="back-link">&larr; Back to dashboard</a>
-        <h1>${route!.Name}</h1>
-        <p class="villages">${route!.Villages || ''}</p>
+        <h1>${escapeHtml(route!.Name)}</h1>
+        <p class="villages">${escapeHtml(route!.Villages)}</p>
         <div class="field-row">
-          <label>Date <input type="date" id="date-input" value="${date}" /></label>
+          <label>Date <input type="date" id="date-input" value="${escapeHtml(date)}" /></label>
         </div>
         <div class="session-tabs">
-          <button type="button" class="session-tab ${session === 'Morning' ? 'active' : ''}" data-session="Morning">Morning</button>
-          <button type="button" class="session-tab ${session === 'Evening' ? 'active' : ''}" data-session="Evening">Evening</button>
+          ${SESSIONS.map(
+            (s) =>
+              `<button type="button" class="session-tab ${session === s ? 'active' : ''}" data-session="${s}">${s}${tabStatus(routeTrips.get(s))}</button>`,
+          ).join('')}
         </div>
+        ${
+          otherAwaiting
+            ? `<div class="banner">The <strong>${other}</strong> trip for ${shortDate(date)} is still awaiting its return and cash. <button type="button" class="link-btn" data-session="${other}">Open ${other} &rarr;</button></div>`
+            : ''
+        }
         <div id="trip-body"></div>
       `;
 
       main.querySelector<HTMLInputElement>('#date-input')!.addEventListener('change', async (e) => {
         const newDate = (e.target as HTMLInputElement).value;
         await flushPendingSave();
-        load(newDate, session);
+        load(newDate);
       });
 
-      main.querySelectorAll<HTMLButtonElement>('.session-tab').forEach((btn) => {
+      main.querySelectorAll<HTMLButtonElement>('.session-tab, .banner [data-session]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const newSession = btn.dataset.session as Session;
           await flushPendingSave();
@@ -95,25 +146,35 @@ export async function renderRouteScreen(container: HTMLElement, routeId: string)
       });
 
       const tripBody = main.querySelector<HTMLDivElement>('#trip-body')!;
+      const reload = () => load(date, session);
 
       if (!tripData) {
-        tripBody.innerHTML = renderDispatchForm(route!, activeProducts);
-        wireDispatchForm(tripBody, routeId, date, session, () => load(date, session));
+        tripBody.innerHTML = renderDispatchForm(route!, activeProducts, session);
+        wireDispatchForm(tripBody, routeId, date, session, reload);
       } else if (tripData.trip.Status === 'Dispatched') {
         tripBody.innerHTML = renderSettleForm(tripData, productMap);
-        pendingSave = wireSettleForm(tripBody, tripData, () => load(date, session));
+        pendingSave = wireSettleForm(tripBody, tripData, reload);
       } else {
         tripBody.innerHTML = renderSettled(tripData, productMap);
+        wireReopen(tripBody, tripData, reload);
       }
     }
 
-    await load(todayStr(), defaultSession());
+    await load(localDateStr(), initialSession);
   } catch (err) {
-    main.innerHTML = `<p class="error">Failed to load: ${(err as Error).message}</p>`;
+    main.innerHTML = `<p class="error">Failed to load: ${escapeHtml((err as Error).message)}</p>`;
   }
 }
 
-function renderDispatchForm(route: Route, products: Product[]): string {
+function renderAuditTrail(trip: Trip): string {
+  const parts: string[] = [];
+  if (trip.DispatchedBy) parts.push(`Dispatched by ${escapeHtml(trip.DispatchedBy)}`);
+  if (trip.ReopenedBy) parts.push(`reopened by ${escapeHtml(trip.ReopenedBy)}`);
+  if (trip.SettledBy) parts.push(`settled by ${escapeHtml(trip.SettledBy)}`);
+  return parts.length ? `<p class="muted audit">${parts.join(' · ')}</p>` : '';
+}
+
+function renderDispatchForm(route: Route, products: Product[], session: Session): string {
   if (products.length === 0) {
     return '<p>No active products. Add some on the Products page before dispatching.</p>';
   }
@@ -121,8 +182,12 @@ function renderDispatchForm(route: Route, products: Product[]): string {
   return `
     <form id="dispatch-form">
       <div class="field-row">
-        <label>Driver <input type="text" name="driver" value="${route.DefaultDriver || ''}" required /></label>
-        <label>Vehicle <input type="text" name="vehicle" value="${route.DefaultVehicle || ''}" required /></label>
+        <label>Driver <input type="text" name="driver" value="${escapeHtml(route.DefaultDriver)}" required /></label>
+        <label>Vehicle <input type="text" name="vehicle" value="${escapeHtml(route.DefaultVehicle)}" required /></label>
+      </div>
+      <div class="field-row">
+        <button type="button" id="copy-last-btn" class="secondary">Same as last ${session} trip</button>
+        <span id="copy-last-status" class="muted"></span>
       </div>
       <table class="line-items">
         <thead><tr><th>Product</th><th>Price</th><th>Qty dispatched</th><th>Value</th></tr></thead>
@@ -130,18 +195,18 @@ function renderDispatchForm(route: Route, products: Product[]): string {
           ${products
             .map(
               (p) => `
-            <tr data-product-id="${p.ProductId}" data-price="${p.Price}">
-              <td>${p.Name} <span class="unit">(${p.Unit})</span></td>
-              <td>₹${p.Price}</td>
-              <td><input type="number" min="0" step="any" class="qty-input" value="0" /></td>
-              <td class="line-total">₹0.00</td>
+            <tr data-product-id="${escapeHtml(p.ProductId)}" data-price="${escapeHtml(p.Price)}">
+              <td>${escapeHtml(p.Name)} <span class="unit">(${escapeHtml(p.Unit)})</span></td>
+              <td>${money(p.Price)}</td>
+              <td><input type="number" min="0" step="any" inputmode="decimal" class="qty-input" placeholder="0" /></td>
+              <td class="line-total">₹0</td>
             </tr>
           `,
             )
             .join('')}
         </tbody>
       </table>
-      <p class="grand-total">Total: ₹<span id="dispatch-total">0.00</span></p>
+      <p class="grand-total">Total: <span id="dispatch-total">₹0</span></p>
       <button type="submit">Dispatch</button>
       <p id="dispatch-error" class="error"></p>
     </form>
@@ -168,14 +233,40 @@ function wireDispatchForm(
       const price = Number(row.dataset.price);
       const qty = Number(row.querySelector<HTMLInputElement>('.qty-input')!.value) || 0;
       const value = price * qty;
-      row.querySelector<HTMLTableCellElement>('.line-total')!.textContent = `₹${value.toFixed(2)}`;
+      row.querySelector<HTMLTableCellElement>('.line-total')!.textContent = money(value);
       total += value;
     });
-    totalEl.textContent = total.toFixed(2);
+    totalEl.textContent = money(total);
   }
 
   rows.forEach((row) => row.querySelector('.qty-input')!.addEventListener('input', recalc));
+  selectOnFocus(form);
   recalc();
+
+  const copyBtn = form.querySelector<HTMLButtonElement>('#copy-last-btn')!;
+  const copyStatus = form.querySelector<HTMLSpanElement>('#copy-last-status')!;
+  copyBtn.addEventListener('click', async () => {
+    copyBtn.disabled = true;
+    copyStatus.textContent = 'Loading...';
+    try {
+      const last = await getLastTrip(routeId, session, date);
+      if (!last) {
+        copyStatus.textContent = `No earlier ${session} trip for this route.`;
+        return;
+      }
+      const qtyByProduct = new Map(last.items.map((i) => [i.ProductId, Number(i.QtyDispatched) || 0]));
+      rows.forEach((row) => {
+        const qty = qtyByProduct.get(row.dataset.productId!);
+        row.querySelector<HTMLInputElement>('.qty-input')!.value = qty ? String(qty) : '';
+      });
+      recalc();
+      copyStatus.textContent = `Filled from the ${shortDate(last.trip.Date)} trip — adjust as needed.`;
+    } catch (err) {
+      copyStatus.textContent = (err as Error).message;
+    } finally {
+      copyBtn.disabled = false;
+    }
+  });
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -211,8 +302,9 @@ function renderSettleForm(tripData: TripWithItems, productMap: Map<string, Produ
   const { trip, items } = tripData;
   return `
     <div class="trip-summary">
-      <p>Driver: ${trip.Driver} · Vehicle: ${trip.Vehicle}</p>
-      <p>Dispatched total: ₹${trip.DispatchedTotal}</p>
+      <p>Driver: ${escapeHtml(trip.Driver)} · Vehicle: ${escapeHtml(trip.Vehicle)}</p>
+      <p>Dispatched total: ${money(trip.DispatchedTotal)}</p>
+      ${renderAuditTrail(trip)}
     </div>
     <form id="settle-form">
       <table class="line-items">
@@ -221,23 +313,23 @@ function renderSettleForm(tripData: TripWithItems, productMap: Map<string, Produ
           ${items
             .map(
               (i) => `
-            <tr data-product-id="${i.ProductId}" data-price="${i.Price}">
-              <td>${productMap.get(i.ProductId)?.Name ?? i.ProductId}</td>
-              <td>${i.QtyDispatched}</td>
-              <td><input type="number" min="0" max="${i.QtyDispatched}" step="any" class="qty-returned" value="${i.QtyReturned || 0}" /></td>
-              <td class="return-value">₹0.00</td>
+            <tr data-product-id="${escapeHtml(i.ProductId)}" data-price="${escapeHtml(i.Price)}">
+              <td>${escapeHtml(productMap.get(i.ProductId)?.Name ?? i.ProductId)}</td>
+              <td>${escapeHtml(i.QtyDispatched)}</td>
+              <td><input type="number" min="0" max="${escapeHtml(i.QtyDispatched)}" step="any" inputmode="decimal" class="qty-returned" placeholder="0" value="${Number(i.QtyReturned) ? escapeHtml(i.QtyReturned) : ''}" /></td>
+              <td class="return-value">₹0</td>
             </tr>
           `,
             )
             .join('')}
         </tbody>
       </table>
-      <p>Returned total: ₹<span id="returned-total">0.00</span></p>
-      <p>Amount due: ₹<span id="amount-due">${Number(trip.DispatchedTotal).toFixed(2)}</span></p>
+      <p>Returned total: <span id="returned-total">₹0</span></p>
+      <p>Amount due: <span id="amount-due">${money(trip.DispatchedTotal)}</span></p>
       <div class="field-row">
-        <label>Cash handed over <input type="number" min="0" step="0.01" id="cash-input" value="${trip.CashHandedOver || 0}" /></label>
+        <label>Cash handed over <input type="number" min="0" step="0.01" inputmode="decimal" id="cash-input" placeholder="0" value="${Number(trip.CashHandedOver) ? escapeHtml(trip.CashHandedOver) : ''}" /></label>
       </div>
-      <p>Discrepancy: ₹<span id="discrepancy">0.00</span></p>
+      <p>Discrepancy: <span id="discrepancy">₹0</span></p>
       <div class="field-row">
         <button type="button" id="save-progress-btn">Save</button>
         <button type="submit">Settle</button>
@@ -280,18 +372,23 @@ function wireSettleForm(
       const price = Number(row.dataset.price);
       const qty = Number(row.querySelector<HTMLInputElement>('.qty-returned')!.value) || 0;
       const value = price * qty;
-      row.querySelector<HTMLTableCellElement>('.return-value')!.textContent = `₹${value.toFixed(2)}`;
+      row.querySelector<HTMLTableCellElement>('.return-value')!.textContent = money(value);
       returnedTotal += value;
     });
     const amountDue = dispatchedTotal - returnedTotal;
-    returnedTotalEl.textContent = returnedTotal.toFixed(2);
-    amountDueEl.textContent = amountDue.toFixed(2);
     const cash = Number(cashInput.value) || 0;
-    discrepancyEl.textContent = (cash - amountDue).toFixed(2);
+    const discrepancy = cash - amountDue;
+    returnedTotalEl.textContent = money(returnedTotal);
+    amountDueEl.textContent = money(amountDue);
+    discrepancyEl.textContent =
+      discrepancy < 0 ? `${money(-discrepancy)} short` : discrepancy > 0 ? `${money(discrepancy)} excess` : '₹0';
+    discrepancyEl.className = discrepancy < 0 ? 'warn' : '';
+    return { amountDue, cash };
   }
 
   rows.forEach((row) => row.querySelector('.qty-returned')!.addEventListener('input', recalc));
   cashInput.addEventListener('input', recalc);
+  selectOnFocus(form);
   recalc();
 
   async function saveCurrent(): Promise<void> {
@@ -323,6 +420,7 @@ function wireSettleForm(
     statusEl.className = '';
 
     const { items, cashHandedOver } = currentInputs();
+    if (!confirmSettle(recalc())) return;
 
     saveBtn.disabled = true;
     settleBtn.disabled = true;
@@ -340,11 +438,28 @@ function wireSettleForm(
   return saveCurrent;
 }
 
+function confirmSettle({ amountDue, cash }: { amountDue: number; cash: number }): boolean {
+  const discrepancy = cash - amountDue;
+  const discLabel =
+    discrepancy === 0 ? 'none' : discrepancy < 0 ? `${money(-discrepancy)} SHORT` : `${money(discrepancy)} excess`;
+  const lines = [
+    `Amount due: ${money(amountDue)}`,
+    `Cash handed over: ${money(cash)}`,
+    `Discrepancy: ${discLabel}`,
+    '',
+    'Once settled, only the owner can reopen this trip.',
+  ];
+  if (cash === 0 && amountDue > 0) {
+    lines.unshift('No cash has been entered!', '');
+  }
+  return window.confirm(`Settle this trip?\n\n${lines.join('\n')}`);
+}
+
 function renderSettled(tripData: TripWithItems, productMap: Map<string, Product>): string {
   const { trip, items } = tripData;
   return `
     <div class="trip-summary settled">
-      <p>Driver: ${trip.Driver} · Vehicle: ${trip.Vehicle}</p>
+      <p>Driver: ${escapeHtml(trip.Driver)} · Vehicle: ${escapeHtml(trip.Vehicle)}</p>
       <table class="line-items">
         <thead><tr><th>Product</th><th>Dispatched</th><th>Returned</th></tr></thead>
         <tbody>
@@ -352,20 +467,56 @@ function renderSettled(tripData: TripWithItems, productMap: Map<string, Product>
             .map(
               (i) => `
             <tr>
-              <td>${productMap.get(i.ProductId)?.Name ?? i.ProductId}</td>
-              <td>${i.QtyDispatched}</td>
-              <td>${i.QtyReturned}</td>
+              <td>${escapeHtml(productMap.get(i.ProductId)?.Name ?? i.ProductId)}</td>
+              <td>${escapeHtml(i.QtyDispatched)}</td>
+              <td>${escapeHtml(i.QtyReturned)}</td>
             </tr>
           `,
             )
             .join('')}
         </tbody>
       </table>
-      <p>Dispatched total: ₹${trip.DispatchedTotal}</p>
-      <p>Returned total: ₹${trip.ReturnedTotal}</p>
-      <p>Amount due: ₹${trip.AmountDue}</p>
-      <p>Cash handed over: ₹${trip.CashHandedOver}</p>
-      <p class="${Number(trip.Discrepancy) === 0 ? 'ok' : 'warn'}">Discrepancy: ₹${trip.Discrepancy}</p>
+      <p>Dispatched total: ${money(trip.DispatchedTotal)}</p>
+      <p>Returned total: ${money(trip.ReturnedTotal)}</p>
+      <p>Amount due: ${money(trip.AmountDue)}</p>
+      <p>Cash handed over: ${money(trip.CashHandedOver)}</p>
+      <p class="${Number(trip.Discrepancy) < 0 ? 'warn' : 'ok'}">Discrepancy: ${
+        Number(trip.Discrepancy) < 0
+          ? `${money(-Number(trip.Discrepancy))} short`
+          : Number(trip.Discrepancy) > 0
+            ? `${money(trip.Discrepancy)} excess`
+            : 'none'
+      }</p>
+      ${renderAuditTrail(trip)}
     </div>
+    <details class="reopen">
+      <summary>Made a mistake? Reopen this trip</summary>
+      <form id="reopen-form" class="field-row">
+        <label>Admin passcode <input type="password" id="admin-passcode" required autocomplete="off" /></label>
+        <button type="submit">Reopen</button>
+      </form>
+      <p id="reopen-error" class="error"></p>
+    </details>
   `;
+}
+
+function wireReopen(container: HTMLElement, tripData: TripWithItems, onDone: () => void) {
+  const form = container.querySelector<HTMLFormElement>('#reopen-form');
+  if (!form) return;
+  const input = form.querySelector<HTMLInputElement>('#admin-passcode')!;
+  const errorEl = container.querySelector<HTMLParagraphElement>('#reopen-error')!;
+  const submitBtn = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errorEl.textContent = '';
+    submitBtn.disabled = true;
+    try {
+      await reopenTrip({ tripId: tripData.trip.TripId, adminToken: input.value });
+      onDone();
+    } catch (err) {
+      errorEl.textContent = (err as Error).message;
+      submitBtn.disabled = false;
+    }
+  });
 }
