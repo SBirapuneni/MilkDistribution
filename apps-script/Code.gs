@@ -113,6 +113,7 @@ function doPost(e) {
       saveProduct: saveProduct,
       saveRoute: saveRoute,
       getTrip: getTrip,
+      getRouteDay: getRouteDay,
       getLastTrip: getLastTrip,
       dispatchTrip: dispatchTrip,
       saveTripProgress: saveTripProgress,
@@ -279,12 +280,12 @@ function saveProduct(payload) {
     updateObjectByRow_(SHEET_NAMES.PRODUCTS, existing.__row, {
       Name: name, Unit: unit, Price: price, Active: active,
     });
-    return { productId: existing.ProductId };
+    return Object.assign({ productId: existing.ProductId }, getMasterData());
   }
 
   const id = newId_('P');
   appendObject_(SHEET_NAMES.PRODUCTS, { ProductId: id, Name: name, Unit: unit, Price: price, Active: active });
-  return { productId: id };
+  return Object.assign({ productId: id }, getMasterData());
 }
 
 function saveRoute(payload) {
@@ -304,12 +305,12 @@ function saveRoute(payload) {
     const existing = routes.filter((r) => r.RouteId === payload.routeId)[0];
     if (!existing) throw new Error('Route not found');
     updateObjectByRow_(SHEET_NAMES.ROUTES, existing.__row, fields);
-    return { routeId: existing.RouteId };
+    return Object.assign({ routeId: existing.RouteId }, getMasterData());
   }
 
   const id = newId_('R');
   appendObject_(SHEET_NAMES.ROUTES, Object.assign({ RouteId: id }, fields));
-  return { routeId: id };
+  return Object.assign({ routeId: id }, getMasterData());
 }
 
 // ---- Trips -----------------------------------------------------------
@@ -468,6 +469,37 @@ function reopenTrip(payload, ctx) {
   return getTrip({ routeId: trip.RouteId, date: formatDate_(trip.Date), session: trip.Session });
 }
 
+// Everything the Route screen needs in one request: master data plus this
+// route's trips on the date — both sessions, with their items (at most two
+// trips), so switching Morning/Evening needs no further request. The session
+// to open is the one asked for, else whichever is still awaiting its return,
+// else the caller's clock-based default.
+function getRouteDay(payload) {
+  const trips = readAll_(SHEET_NAMES.TRIPS).filter(
+    (t) => t.RouteId === payload.routeId && formatDate_(t.Date) === payload.date,
+  );
+  const tripIds = {};
+  trips.forEach((t) => { tripIds[t.TripId] = true; });
+  const items = trips.length ? readAll_(SHEET_NAMES.TRIP_ITEMS).filter((i) => tripIds[i.TripId]) : [];
+
+  const days = trips.map((t) => {
+    const trip = stripRow_(t);
+    trip.Date = formatDate_(t.Date);
+    return { trip: trip, items: items.filter((i) => i.TripId === t.TripId).map(stripRow_) };
+  });
+
+  let session = payload.session;
+  if (session !== 'Morning' && session !== 'Evening') {
+    const awaiting = ['Morning', 'Evening'].filter((s) =>
+      days.some((d) => d.trip.Session === s && d.trip.Status === 'Dispatched'),
+    )[0];
+    session = awaiting || (payload.fallbackSession === 'Evening' ? 'Evening' : 'Morning');
+  }
+
+  const master = getMasterData();
+  return { products: master.products, routes: master.routes, session: session, trips: days };
+}
+
 // The most recent earlier trip for this route and session — used to pre-fill
 // the dispatch form, since quantities barely change day to day.
 function getLastTrip(payload) {
@@ -530,25 +562,36 @@ function getTodayStatus(payload) {
 // ₹500 over must not show up as ₹0.
 
 function getAnalytics(payload) {
-  const trips = readAll_(SHEET_NAMES.TRIPS).filter((t) => t.Status === 'Settled');
-  const filtered = trips.filter((t) => {
+  // Read each sheet once, then compute the requested range and, if asked,
+  // the comparison range from the same data — one request instead of two.
+  const settled = readAll_(SHEET_NAMES.TRIPS).filter((t) => t.Status === 'Settled');
+
+  const routeMap = {};
+  readAll_(SHEET_NAMES.ROUTES).forEach((r) => { routeMap[r.RouteId] = r.Name; });
+
+  const productMap = {};
+  readAll_(SHEET_NAMES.PRODUCTS).forEach((p) => { productMap[p.ProductId] = p.Name; });
+
+  const allItems = readAll_(SHEET_NAMES.TRIP_ITEMS);
+
+  const result = computeAnalytics_(settled, allItems, routeMap, productMap, payload);
+  if (payload.previous) {
+    result.previous = computeAnalytics_(settled, allItems, routeMap, productMap, payload.previous);
+  }
+  return result;
+}
+
+function computeAnalytics_(settled, allItems, routeMap, productMap, range) {
+  const filtered = settled.filter((t) => {
     const d = formatDate_(t.Date);
-    if (payload.dateFrom && d < payload.dateFrom) return false;
-    if (payload.dateTo && d > payload.dateTo) return false;
+    if (range.dateFrom && d < range.dateFrom) return false;
+    if (range.dateTo && d > range.dateTo) return false;
     return true;
   });
 
-  const routes = readAll_(SHEET_NAMES.ROUTES);
-  const routeMap = {};
-  routes.forEach((r) => { routeMap[r.RouteId] = r.Name; });
-
-  const products = readAll_(SHEET_NAMES.PRODUCTS);
-  const productMap = {};
-  products.forEach((p) => { productMap[p.ProductId] = p.Name; });
-
   const tripIds = {};
   filtered.forEach((t) => { tripIds[t.TripId] = true; });
-  const items = readAll_(SHEET_NAMES.TRIP_ITEMS).filter((i) => tripIds[i.TripId]);
+  const items = allItems.filter((i) => tripIds[i.TripId]);
 
   let totalDispatched = 0;
   let totalReturned = 0;

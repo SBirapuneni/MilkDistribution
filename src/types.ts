@@ -60,6 +60,12 @@ export interface MasterData {
   routes: Route[];
 }
 
+/** Everything the Route screen needs, in one request. */
+export interface RouteDay extends MasterData {
+  session: Session; // the session to open
+  trips: TripWithItems[]; // this route's trips on the date: 0–2, one per session
+}
+
 export interface AnalyticsSummary {
   totalDispatched: number;
   totalReturned: number;
@@ -129,4 +135,5 @@ export interface Analytics {
   byDriver: AnalyticsByDriver[];
   bySession: AnalyticsBySession[];
   byProduct: AnalyticsByProduct[];
+  previous?: Analytics; // comparison range, when requested
 }

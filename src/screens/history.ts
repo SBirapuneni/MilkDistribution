@@ -26,17 +26,6 @@ export async function renderHistory(container: HTMLElement) {
   const dateFrom = container.querySelector<HTMLInputElement>('#date-from')!;
   const dateTo = container.querySelector<HTMLInputElement>('#date-to')!;
 
-  try {
-    const { routes } = await getMasterData();
-    routeFilter.insertAdjacentHTML(
-      'beforeend',
-      routes.map((r) => `<option value="${escapeHtml(r.RouteId)}">${escapeHtml(r.Name)}</option>`).join(''),
-    );
-  } catch (err) {
-    content.innerHTML = `<p class="error">Failed to load routes: ${escapeHtml((err as Error).message)}</p>`;
-    return;
-  }
-
   async function load() {
     content.innerHTML = 'Loading...';
     try {
@@ -52,7 +41,20 @@ export async function renderHistory(container: HTMLElement) {
   }
 
   [routeFilter, dateFrom, dateTo].forEach((el) => el.addEventListener('change', load));
-  await load();
+
+  // Fetch the route list (for the filter) and the trips at the same time,
+  // rather than one after the other.
+  const routesLoaded = getMasterData().then(
+    ({ routes }) =>
+      routeFilter.insertAdjacentHTML(
+        'beforeend',
+        routes.map((r) => `<option value="${escapeHtml(r.RouteId)}">${escapeHtml(r.Name)}</option>`).join(''),
+      ),
+    () => {
+      // Without the list the filter just offers "All routes"; trips still load.
+    },
+  );
+  await Promise.all([load(), routesLoaded]);
 }
 
 function discrepancyCell(value: Trip['Discrepancy']): string {

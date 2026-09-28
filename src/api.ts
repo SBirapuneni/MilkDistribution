@@ -1,4 +1,4 @@
-import type { Analytics, MasterData, Session, Trip, TripWithItems } from './types';
+import type { Analytics, MasterData, RouteDay, Session, Trip, TripWithItems } from './types';
 import * as mock from './mock';
 
 const API_URL = import.meta.env.VITE_API_URL;
@@ -63,16 +63,74 @@ function call<T>(action: string, payload: Record<string, unknown> = {}): Promise
   return rawCall<T>(getToken(), action, payload);
 }
 
-export function verifyToken(token: string): Promise<MasterData> {
-  if (DEMO_MODE) {
-    if (token !== DEMO_PASSCODE) return Promise.reject(new Error('Invalid passcode'));
-    return mock.getMasterData();
-  }
-  return rawCall<MasterData>(token, 'getMasterData');
+// Apps Script spins down when idle, and the first request after that pays a
+// multi-second start-up. Poke it (unauthenticated doGet, response ignored) as
+// soon as the app opens, while the user is still reading the screen or
+// typing the passcode, so the first real request finds it awake.
+export function warmUp() {
+  if (!API_URL) return;
+  fetch(API_URL, { method: 'GET', mode: 'no-cors' }).catch(() => {});
 }
 
-export function getMasterData(): Promise<MasterData> {
-  return DEMO_MODE ? mock.getMasterData() : call('getMasterData');
+// ---- Master data cache ----------------------------------------------------
+// Products and routes change rarely but were fetched on every screen — each
+// fetch a full Apps Script round trip (~1 s). Keep them for the session and
+// refresh from every response that carries them (login, Route screen, saves),
+// with a time limit so edits made on another phone show up.
+
+const MASTER_KEY = 'milk_app_master';
+const MASTER_TTL_MS = 5 * 60 * 1000;
+
+function readMasterCache(): MasterData | null {
+  try {
+    const raw = sessionStorage.getItem(MASTER_KEY);
+    if (!raw) return null;
+    const { at, data } = JSON.parse(raw) as { at: number; data: MasterData };
+    return Date.now() - at < MASTER_TTL_MS ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeMasterCache(data: MasterData) {
+  try {
+    sessionStorage.setItem(MASTER_KEY, JSON.stringify({ at: Date.now(), data: { products: data.products, routes: data.routes } }));
+  } catch {
+    // Storage full/blocked: we just refetch next time.
+  }
+}
+
+export function clearMasterCache() {
+  try {
+    sessionStorage.removeItem(MASTER_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export async function verifyToken(token: string): Promise<MasterData> {
+  if (DEMO_MODE) {
+    if (token !== DEMO_PASSCODE) throw new Error('Invalid passcode');
+    return mock.getMasterData();
+  }
+  const data = await rawCall<MasterData>(token, 'getMasterData');
+  writeMasterCache(data);
+  return data;
+}
+
+export async function getMasterData(): Promise<MasterData> {
+  if (DEMO_MODE) return mock.getMasterData();
+  const cached = readMasterCache();
+  if (cached) return cached;
+  const data = await call<MasterData>('getMasterData');
+  writeMasterCache(data);
+  return data;
+}
+
+async function withMaster<T extends MasterData>(p: Promise<T>): Promise<T> {
+  const data = await p;
+  if (!DEMO_MODE) writeMasterCache(data);
+  return data;
 }
 
 export function saveProduct(payload: {
@@ -81,8 +139,8 @@ export function saveProduct(payload: {
   unit: string;
   price: number;
   active: boolean;
-}): Promise<{ productId: string }> {
-  return DEMO_MODE ? mock.saveProduct(payload) : call('saveProduct', payload);
+}): Promise<{ productId: string } & MasterData> {
+  return withMaster(DEMO_MODE ? mock.saveProduct(payload) : call('saveProduct', payload));
 }
 
 export function saveRoute(payload: {
@@ -92,12 +150,17 @@ export function saveRoute(payload: {
   defaultVehicle: string;
   defaultDriver: string;
   active: boolean;
-}): Promise<{ routeId: string }> {
-  return DEMO_MODE ? mock.saveRoute(payload) : call('saveRoute', payload);
+}): Promise<{ routeId: string } & MasterData> {
+  return withMaster(DEMO_MODE ? mock.saveRoute(payload) : call('saveRoute', payload));
 }
 
-export function getTrip(routeId: string, date: string, session: Session): Promise<TripWithItems | null> {
-  return DEMO_MODE ? mock.getTrip(routeId, date, session) : call('getTrip', { routeId, date, session });
+export function getRouteDay(payload: {
+  routeId: string;
+  date: string;
+  session?: Session;
+  fallbackSession: Session;
+}): Promise<RouteDay> {
+  return withMaster(DEMO_MODE ? mock.getRouteDay(payload) : call('getRouteDay', payload));
 }
 
 export function getLastTrip(routeId: string, session: Session, beforeDate: string): Promise<TripWithItems | null> {
@@ -145,6 +208,8 @@ export function getTodayStatus(date: string): Promise<Trip[]> {
   return DEMO_MODE ? mock.getTodayStatus(date) : call('getTodayStatus', { date });
 }
 
-export function getAnalytics(payload: { dateFrom?: string; dateTo?: string } = {}): Promise<Analytics> {
+export function getAnalytics(
+  payload: { dateFrom?: string; dateTo?: string; previous?: { dateFrom: string; dateTo: string } } = {},
+): Promise<Analytics> {
   return DEMO_MODE ? mock.getAnalytics(payload) : call('getAnalytics', payload);
 }

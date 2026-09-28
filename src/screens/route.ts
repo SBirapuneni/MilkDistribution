@@ -1,29 +1,12 @@
 import { navHtml, wireNav } from '../components/nav';
-import {
-  dispatchTrip,
-  getLastTrip,
-  getMasterData,
-  getTodayStatus,
-  getTrip,
-  reopenTrip,
-  saveTripProgress,
-  settleTrip,
-} from '../api';
-import type { Product, Route, Session, Trip, TripWithItems } from '../types';
+import { dispatchTrip, getLastTrip, getRouteDay, reopenTrip, saveTripProgress, settleTrip } from '../api';
+import type { Product, Route, RouteDay, Session, Trip, TripWithItems } from '../types';
 import { escapeHtml, localDateStr, money, shortDate } from '../util';
 
 const SESSIONS: Session[] = ['Morning', 'Evening'];
 
 function clockSession(): Session {
   return new Date().getHours() < 15 ? 'Morning' : 'Evening';
-}
-
-// Open the session that needs attention rather than going purely by the
-// clock: a Morning trip still awaiting its return at 8 PM must not be hidden
-// behind an empty Evening dispatch form.
-function pickSession(routeTrips: Map<Session, Trip>): Session {
-  const awaiting = SESSIONS.find((s) => routeTrips.get(s)?.Status === 'Dispatched');
-  return awaiting ?? clockSession();
 }
 
 // Tapping a quantity box selects its contents, so typing replaces the value
@@ -34,136 +17,143 @@ function selectOnFocus(root: HTMLElement) {
   );
 }
 
+// Everything on this screen for one date comes from a single getRouteDay
+// request (master data + both sessions' trips with items). Switching session
+// re-renders from that without another request, and after a dispatch, settle
+// or reopen the server's response is used directly instead of reloading.
 export async function renderRouteScreen(container: HTMLElement, routeId: string, initialSession?: Session) {
   container.innerHTML = navHtml('dashboard') + '<main class="page"><p>Loading...</p></main>';
   wireNav(container);
 
   const main = container.querySelector<HTMLElement>('main')!;
 
-  try {
-    const { products, routes } = await getMasterData();
-    const route = routes.find((r) => r.RouteId === routeId);
+  // Holds a save function for whatever settle form is currently on screen, so
+  // navigating away (dashboard, other tabs, switching date/session) can flush
+  // unsaved return-quantity/cash entries instead of silently discarding them.
+  let pendingSave: (() => Promise<void>) | null = null;
+
+  async function flushPendingSave() {
+    if (!pendingSave) return;
+    const save = pendingSave;
+    pendingSave = null;
+    try {
+      await save();
+    } catch {
+      // Best-effort: don't block navigation if the save fails.
+    }
+  }
+
+  container.addEventListener(
+    'click',
+    (e) => {
+      const link = (e.target as HTMLElement).closest('a[href^="#"]') as HTMLAnchorElement | null;
+      if (!link || !pendingSave) return;
+      e.preventDefault();
+      const href = link.getAttribute('href')!;
+      flushPendingSave().then(() => {
+        window.location.hash = href;
+      });
+    },
+    { capture: true },
+  );
+
+  let day: { date: string; data: RouteDay; trips: Map<Session, TripWithItems> } | null = null;
+
+  async function load(date: string, session?: Session) {
+    main.innerHTML = '<p>Loading...</p>';
+    try {
+      const data = await getRouteDay({ routeId, date, session, fallbackSession: clockSession() });
+      day = { date, data, trips: new Map(data.trips.map((t) => [t.trip.Session, t])) };
+      show(data.session);
+    } catch (err) {
+      main.innerHTML = `<p class="error">Failed to load: ${escapeHtml((err as Error).message)}</p>`;
+    }
+  }
+
+  // A mutation returned the trip's new state: store it and re-render.
+  function applyTrip(tripData: TripWithItems) {
+    if (!day) return;
+    day.trips.set(tripData.trip.Session, tripData);
+    show(tripData.trip.Session);
+  }
+
+  function tabStatus(trip: Trip | undefined): string {
+    if (!trip) return '';
+    return trip.Status === 'Settled'
+      ? '<span class="tab-status">Settled</span>'
+      : '<span class="tab-status pending">Awaiting return</span>';
+  }
+
+  function show(session: Session) {
+    if (!day) return;
+    pendingSave = null;
+    const { date, data, trips } = day;
+
+    const route = data.routes.find((r) => r.RouteId === routeId);
     if (!route) {
       main.innerHTML = '<p class="error">Route not found.</p>';
       return;
     }
+    const activeProducts = data.products.filter((p) => p.Active !== false && String(p.Active).toUpperCase() !== 'FALSE');
+    const productMap = new Map(data.products.map((p) => [p.ProductId, p]));
+    const tripData = trips.get(session) ?? null;
 
-    const activeProducts = products.filter((p) => p.Active !== false && String(p.Active).toUpperCase() !== 'FALSE');
-    const productMap = new Map(products.map((p) => [p.ProductId, p]));
+    // Keep the session in the URL so a refresh or shared link lands on it.
+    // replaceState doesn't fire hashchange, so this doesn't re-render.
+    history.replaceState(null, '', `#/route/${encodeURIComponent(routeId)}/${session}`);
 
-    // Holds a save function for whatever settle form is currently on screen, so
-    // navigating away (dashboard, other tabs, switching date/session) can flush
-    // unsaved return-quantity/cash entries instead of silently discarding them.
-    let pendingSave: (() => Promise<void>) | null = null;
+    const other = SESSIONS.find((s) => s !== session)!;
+    const otherAwaiting = trips.get(other)?.trip.Status === 'Dispatched';
 
-    async function flushPendingSave() {
-      if (!pendingSave) return;
-      const save = pendingSave;
-      pendingSave = null;
-      try {
-        await save();
-      } catch {
-        // Best-effort: don't block navigation if the save fails.
+    main.innerHTML = `
+      <a href="#/" class="back-link">&larr; Back to dashboard</a>
+      <h1>${escapeHtml(route.Name)}</h1>
+      <p class="villages">${escapeHtml(route.Villages)}</p>
+      <div class="field-row">
+        <label>Date <input type="date" id="date-input" value="${escapeHtml(date)}" /></label>
+      </div>
+      <div class="session-tabs">
+        ${SESSIONS.map(
+          (s) =>
+            `<button type="button" class="session-tab ${session === s ? 'active' : ''}" data-session="${s}">${s}${tabStatus(trips.get(s)?.trip)}</button>`,
+        ).join('')}
+      </div>
+      ${
+        otherAwaiting
+          ? `<div class="banner">The <strong>${other}</strong> trip for ${shortDate(date)} is still awaiting its return and cash. <button type="button" class="link-btn" data-session="${other}">Open ${other} &rarr;</button></div>`
+          : ''
       }
-    }
+      <div id="trip-body"></div>
+    `;
 
-    container.addEventListener(
-      'click',
-      (e) => {
-        const link = (e.target as HTMLElement).closest('a[href^="#"]') as HTMLAnchorElement | null;
-        if (!link || !pendingSave) return;
-        e.preventDefault();
-        const href = link.getAttribute('href')!;
-        flushPendingSave().then(() => {
-          window.location.hash = href;
-        });
-      },
-      { capture: true },
-    );
+    main.querySelector<HTMLInputElement>('#date-input')!.addEventListener('change', async (e) => {
+      const newDate = (e.target as HTMLInputElement).value;
+      await flushPendingSave();
+      load(newDate);
+    });
 
-    async function routeTripsOn(date: string): Promise<Map<Session, Trip>> {
-      const trips = await getTodayStatus(date);
-      return new Map(trips.filter((t) => t.RouteId === routeId).map((t) => [t.Session, t]));
-    }
-
-    async function load(date: string, session?: Session) {
-      main.innerHTML = '<p>Loading...</p>';
-      const routeTrips = await routeTripsOn(date);
-      const chosen = session ?? pickSession(routeTrips);
-      const tripData = routeTrips.has(chosen) ? await getTrip(routeId, date, chosen) : null;
-      // Keep the session in the URL so a refresh or shared link lands on it.
-      // replaceState doesn't fire hashchange, so this doesn't re-render.
-      history.replaceState(null, '', `#/route/${encodeURIComponent(routeId)}/${chosen}`);
-      renderContent(date, chosen, tripData, routeTrips);
-    }
-
-    function tabStatus(trip: Trip | undefined): string {
-      if (!trip) return '';
-      return trip.Status === 'Settled'
-        ? '<span class="tab-status">Settled</span>'
-        : '<span class="tab-status pending">Awaiting return</span>';
-    }
-
-    function renderContent(date: string, session: Session, tripData: TripWithItems | null, routeTrips: Map<Session, Trip>) {
-      pendingSave = null;
-
-      const other = SESSIONS.find((s) => s !== session)!;
-      const otherAwaiting = routeTrips.get(other)?.Status === 'Dispatched';
-
-      main.innerHTML = `
-        <a href="#/" class="back-link">&larr; Back to dashboard</a>
-        <h1>${escapeHtml(route!.Name)}</h1>
-        <p class="villages">${escapeHtml(route!.Villages)}</p>
-        <div class="field-row">
-          <label>Date <input type="date" id="date-input" value="${escapeHtml(date)}" /></label>
-        </div>
-        <div class="session-tabs">
-          ${SESSIONS.map(
-            (s) =>
-              `<button type="button" class="session-tab ${session === s ? 'active' : ''}" data-session="${s}">${s}${tabStatus(routeTrips.get(s))}</button>`,
-          ).join('')}
-        </div>
-        ${
-          otherAwaiting
-            ? `<div class="banner">The <strong>${other}</strong> trip for ${shortDate(date)} is still awaiting its return and cash. <button type="button" class="link-btn" data-session="${other}">Open ${other} &rarr;</button></div>`
-            : ''
-        }
-        <div id="trip-body"></div>
-      `;
-
-      main.querySelector<HTMLInputElement>('#date-input')!.addEventListener('change', async (e) => {
-        const newDate = (e.target as HTMLInputElement).value;
+    main.querySelectorAll<HTMLButtonElement>('.session-tab, .banner [data-session]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
         await flushPendingSave();
-        load(newDate);
+        show(btn.dataset.session as Session);
       });
+    });
 
-      main.querySelectorAll<HTMLButtonElement>('.session-tab, .banner [data-session]').forEach((btn) => {
-        btn.addEventListener('click', async () => {
-          const newSession = btn.dataset.session as Session;
-          await flushPendingSave();
-          load(date, newSession);
-        });
-      });
+    const tripBody = main.querySelector<HTMLDivElement>('#trip-body')!;
 
-      const tripBody = main.querySelector<HTMLDivElement>('#trip-body')!;
-      const reload = () => load(date, session);
-
-      if (!tripData) {
-        tripBody.innerHTML = renderDispatchForm(route!, activeProducts, session);
-        wireDispatchForm(tripBody, routeId, date, session, reload);
-      } else if (tripData.trip.Status === 'Dispatched') {
-        tripBody.innerHTML = renderSettleForm(tripData, productMap);
-        pendingSave = wireSettleForm(tripBody, tripData, reload);
-      } else {
-        tripBody.innerHTML = renderSettled(tripData, productMap);
-        wireReopen(tripBody, tripData, reload);
-      }
+    if (!tripData) {
+      tripBody.innerHTML = renderDispatchForm(route, activeProducts, session);
+      wireDispatchForm(tripBody, routeId, date, session, applyTrip);
+    } else if (tripData.trip.Status === 'Dispatched') {
+      tripBody.innerHTML = renderSettleForm(tripData, productMap);
+      pendingSave = wireSettleForm(tripBody, tripData, applyTrip, (saved) => trips.set(session, saved));
+    } else {
+      tripBody.innerHTML = renderSettled(tripData, productMap);
+      wireReopen(tripBody, tripData, applyTrip);
     }
-
-    await load(localDateStr(), initialSession);
-  } catch (err) {
-    main.innerHTML = `<p class="error">Failed to load: ${escapeHtml((err as Error).message)}</p>`;
   }
+
+  await load(localDateStr(), initialSession);
 }
 
 function renderAuditTrail(trip: Trip): string {
@@ -218,7 +208,7 @@ function wireDispatchForm(
   routeId: string,
   date: string,
   session: Session,
-  onDone: () => void,
+  onDone: (tripData: TripWithItems) => void,
 ) {
   const form = container.querySelector<HTMLFormElement>('#dispatch-form');
   if (!form) return;
@@ -289,8 +279,7 @@ function wireDispatchForm(
     const submitBtn = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
     submitBtn.disabled = true;
     try {
-      await dispatchTrip({ routeId, date, session, driver, vehicle, items });
-      onDone();
+      onDone(await dispatchTrip({ routeId, date, session, driver, vehicle, items }));
     } catch (err) {
       errorEl.textContent = (err as Error).message;
       submitBtn.disabled = false;
@@ -342,7 +331,8 @@ function renderSettleForm(tripData: TripWithItems, productMap: Map<string, Produ
 function wireSettleForm(
   container: HTMLElement,
   tripData: TripWithItems,
-  onDone: () => void,
+  onDone: (tripData: TripWithItems) => void,
+  onSaved: (tripData: TripWithItems) => void,
 ): () => Promise<void> {
   const form = container.querySelector<HTMLFormElement>('#settle-form');
   if (!form) return async () => {};
@@ -386,14 +376,22 @@ function wireSettleForm(
     return { amountDue, cash };
   }
 
-  rows.forEach((row) => row.querySelector('.qty-returned')!.addEventListener('input', recalc));
-  cashInput.addEventListener('input', recalc);
+  // Only entries changed since the last save are worth a request.
+  let dirty = false;
+  const markDirty = () => {
+    dirty = true;
+    recalc();
+  };
+  rows.forEach((row) => row.querySelector('.qty-returned')!.addEventListener('input', markDirty));
+  cashInput.addEventListener('input', markDirty);
   selectOnFocus(form);
   recalc();
 
   async function saveCurrent(): Promise<void> {
+    if (!dirty) return;
     const { items, cashHandedOver } = currentInputs();
-    await saveTripProgress({ tripId: tripData.trip.TripId, items, cashHandedOver });
+    onSaved(await saveTripProgress({ tripId: tripData.trip.TripId, items, cashHandedOver }));
+    dirty = false;
   }
 
   saveBtn.addEventListener('click', async () => {
@@ -402,6 +400,7 @@ function wireSettleForm(
     saveBtn.disabled = true;
     settleBtn.disabled = true;
     try {
+      dirty = true; // an explicit Save always saves
       await saveCurrent();
       statusEl.textContent = 'Progress saved.';
       statusEl.className = 'ok';
@@ -425,8 +424,7 @@ function wireSettleForm(
     saveBtn.disabled = true;
     settleBtn.disabled = true;
     try {
-      await settleTrip({ tripId: tripData.trip.TripId, items, cashHandedOver });
-      onDone();
+      onDone(await settleTrip({ tripId: tripData.trip.TripId, items, cashHandedOver }));
     } catch (err) {
       statusEl.textContent = (err as Error).message;
       statusEl.className = 'error';
@@ -500,7 +498,7 @@ function renderSettled(tripData: TripWithItems, productMap: Map<string, Product>
   `;
 }
 
-function wireReopen(container: HTMLElement, tripData: TripWithItems, onDone: () => void) {
+function wireReopen(container: HTMLElement, tripData: TripWithItems, onDone: (tripData: TripWithItems) => void) {
   const form = container.querySelector<HTMLFormElement>('#reopen-form');
   if (!form) return;
   const input = form.querySelector<HTMLInputElement>('#admin-passcode')!;
@@ -512,8 +510,7 @@ function wireReopen(container: HTMLElement, tripData: TripWithItems, onDone: () 
     errorEl.textContent = '';
     submitBtn.disabled = true;
     try {
-      await reopenTrip({ tripId: tripData.trip.TripId, adminToken: input.value });
-      onDone();
+      onDone(await reopenTrip({ tripId: tripData.trip.TripId, adminToken: input.value }));
     } catch (err) {
       errorEl.textContent = (err as Error).message;
       submitBtn.disabled = false;
