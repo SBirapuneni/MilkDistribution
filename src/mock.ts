@@ -1,6 +1,7 @@
 import type {
   Analytics,
   AnalyticsByDate,
+  AnalyticsByDriver,
   AnalyticsByProduct,
   AnalyticsByRoute,
   AnalyticsBySession,
@@ -26,6 +27,8 @@ const routes: Route[] = [
   { RouteId: 'R4', Name: 'Route 4', Villages: 'Devipuram, Shivapur', DefaultVehicle: 'KA-01-AB-4567', DefaultDriver: 'Vijay', Active: true },
   { RouteId: 'R5', Name: 'Route 5', Villages: 'Anandpur', DefaultVehicle: 'KA-01-AB-5678', DefaultDriver: 'Ganesh', Active: true },
 ];
+
+export const DEMO_ADMIN_PASSCODE = 'admin';
 
 const trips: Trip[] = [];
 const tripItems: TripItem[] = [];
@@ -98,6 +101,13 @@ export async function getTrip(routeId: string, date: string, session: Session): 
   return { trip: { ...trip }, items: items.map((i) => ({ ...i })) };
 }
 
+export async function getLastTrip(routeId: string, session: Session, beforeDate: string): Promise<TripWithItems | null> {
+  const last = trips
+    .filter((t) => t.RouteId === routeId && t.Session === session && t.Date < beforeDate)
+    .sort((a, b) => b.Date.localeCompare(a.Date))[0];
+  return last ? getTrip(last.RouteId, last.Date, last.Session) : null;
+}
+
 export async function dispatchTrip(payload: {
   routeId: string;
   date: string;
@@ -105,7 +115,7 @@ export async function dispatchTrip(payload: {
   driver: string;
   vehicle: string;
   items: { productId: string; qty: number }[];
-}): Promise<TripWithItems> {
+}, user: string): Promise<TripWithItems> {
   const existing = await getTrip(payload.routeId, payload.date, payload.session);
   if (existing) throw new Error('This route already has a ' + payload.session + ' trip for ' + payload.date);
 
@@ -148,6 +158,7 @@ export async function dispatchTrip(payload: {
     Discrepancy: '',
     CreatedAt: new Date().toISOString(),
     SettledAt: '',
+    DispatchedBy: user,
   });
   tripItems.push(...newItems);
 
@@ -158,16 +169,22 @@ function applyReturns(
   trip: Trip,
   payload: { tripId: string; items: { productId: string; qtyReturned: number }[]; cashHandedOver: number },
   finalize: boolean,
+  user: string,
 ) {
   const items = tripItems.filter((i) => i.TripId === payload.tripId);
   const returnMap = new Map(payload.items.map((i) => [i.productId, i.qtyReturned]));
 
-  let returnedTotal = 0;
   items.forEach((item) => {
     const qtyReturned = returnMap.get(item.ProductId) || 0;
+    if (qtyReturned < 0) throw new Error('Returned qty cannot be negative for product ' + item.ProductId);
     if (qtyReturned > item.QtyDispatched) {
       throw new Error('Returned qty exceeds dispatched qty for product ' + item.ProductId);
     }
+  });
+
+  let returnedTotal = 0;
+  items.forEach((item) => {
+    const qtyReturned = returnMap.get(item.ProductId) || 0;
     item.QtyReturned = qtyReturned;
     item.ReturnedValue = qtyReturned * item.Price;
     returnedTotal += item.ReturnedValue;
@@ -183,6 +200,7 @@ function applyReturns(
   trip.CashHandedOver = cashHandedOver;
   trip.Discrepancy = cashHandedOver - amountDue;
   trip.SettledAt = finalize ? new Date().toISOString() : '';
+  trip.SettledBy = finalize ? user : '';
 }
 
 export async function saveTripProgress(payload: {
@@ -193,7 +211,7 @@ export async function saveTripProgress(payload: {
   const trip = trips.find((t) => t.TripId === payload.tripId);
   if (!trip) throw new Error('Trip not found');
   if (trip.Status === 'Settled') throw new Error('Trip already settled');
-  applyReturns(trip, payload, false);
+  applyReturns(trip, payload, false, '');
   return (await getTrip(trip.RouteId, trip.Date, trip.Session))!;
 }
 
@@ -201,12 +219,25 @@ export async function settleTrip(payload: {
   tripId: string;
   items: { productId: string; qtyReturned: number }[];
   cashHandedOver: number;
-}): Promise<TripWithItems> {
+}, user: string): Promise<TripWithItems> {
   const trip = trips.find((t) => t.TripId === payload.tripId);
   if (!trip) throw new Error('Trip not found');
   if (trip.Status === 'Settled') throw new Error('Trip already settled');
-  applyReturns(trip, payload, true);
+  applyReturns(trip, payload, true, user);
 
+  return (await getTrip(trip.RouteId, trip.Date, trip.Session))!;
+}
+
+export async function reopenTrip(payload: { tripId: string; adminToken: string }, user: string): Promise<TripWithItems> {
+  if (payload.adminToken !== DEMO_ADMIN_PASSCODE) throw new Error('Incorrect admin passcode');
+  const trip = trips.find((t) => t.TripId === payload.tripId);
+  if (!trip) throw new Error('Trip not found');
+  if (trip.Status !== 'Settled') throw new Error('Trip is not settled');
+  trip.Status = 'Dispatched';
+  trip.SettledAt = '';
+  trip.SettledBy = '';
+  trip.ReopenedBy = user;
+  trip.ReopenedAt = new Date().toISOString();
   return (await getTrip(trip.RouteId, trip.Date, trip.Session))!;
 }
 
@@ -246,9 +277,12 @@ export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string
   let totalReturned = 0;
   let totalCash = 0;
   let totalDiscrepancy = 0;
+  let totalShortage = 0;
+  let totalExcess = 0;
 
   const byDateMap = new Map<string, AnalyticsByDate>();
   const byRouteMap = new Map<string, AnalyticsByRoute>();
+  const byDriverMap = new Map<string, AnalyticsByDriver>();
   const bySessionMap = new Map<Session, AnalyticsBySession>([
     ['Morning', { session: 'Morning', dispatched: 0, returned: 0, tripCount: 0, revenue: 0 }],
     ['Evening', { session: 'Evening', dispatched: 0, returned: 0, tripCount: 0, revenue: 0 }],
@@ -259,19 +293,25 @@ export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string
     const returned = Number(t.ReturnedTotal) || 0;
     const discrepancy = Number(t.Discrepancy) || 0;
     const cash = Number(t.CashHandedOver) || 0;
+    const shortage = discrepancy < 0 ? -discrepancy : 0;
+    const excess = discrepancy > 0 ? discrepancy : 0;
 
     totalDispatched += dispatched;
     totalReturned += returned;
     totalCash += cash;
     totalDiscrepancy += discrepancy;
+    totalShortage += shortage;
+    totalExcess += excess;
 
     if (!byDateMap.has(t.Date)) {
-      byDateMap.set(t.Date, { date: t.Date, dispatched: 0, returned: 0, discrepancy: 0, tripCount: 0, revenue: 0 });
+      byDateMap.set(t.Date, { date: t.Date, dispatched: 0, returned: 0, cash: 0, discrepancy: 0, shortage: 0, tripCount: 0, revenue: 0 });
     }
     const byDate = byDateMap.get(t.Date)!;
     byDate.dispatched += dispatched;
     byDate.returned += returned;
     byDate.discrepancy += discrepancy;
+    byDate.shortage += shortage;
+    byDate.cash += cash;
     byDate.tripCount += 1;
     byDate.revenue = byDate.dispatched - byDate.returned;
 
@@ -282,6 +322,8 @@ export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string
         dispatched: 0,
         returned: 0,
         discrepancy: 0,
+        shortage: 0,
+        excess: 0,
         tripCount: 0,
         revenue: 0,
       });
@@ -290,8 +332,21 @@ export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string
     byRoute.dispatched += dispatched;
     byRoute.returned += returned;
     byRoute.discrepancy += discrepancy;
+    byRoute.shortage += shortage;
+    byRoute.excess += excess;
     byRoute.tripCount += 1;
     byRoute.revenue = byRoute.dispatched - byRoute.returned;
+
+    const driver = t.Driver.trim() || '(no driver)';
+    if (!byDriverMap.has(driver)) {
+      byDriverMap.set(driver, { driver, tripCount: 0, shortTrips: 0, shortage: 0, excess: 0, discrepancy: 0 });
+    }
+    const byDriver = byDriverMap.get(driver)!;
+    byDriver.tripCount += 1;
+    if (shortage > 0) byDriver.shortTrips += 1;
+    byDriver.shortage += shortage;
+    byDriver.excess += excess;
+    byDriver.discrepancy += discrepancy;
 
     const bySession = bySessionMap.get(t.Session);
     if (bySession) {
@@ -332,10 +387,13 @@ export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string
       totalRevenue: totalDispatched - totalReturned,
       totalCash,
       totalDiscrepancy,
+      totalShortage,
+      totalExcess,
       tripCount: settled.length,
     },
     byDate: Array.from(byDateMap.values()).sort((a, b) => a.date.localeCompare(b.date)),
     byRoute: Array.from(byRouteMap.values()).sort((a, b) => b.revenue - a.revenue),
+    byDriver: Array.from(byDriverMap.values()).sort((a, b) => b.shortage - a.shortage || b.excess - a.excess),
     bySession: Array.from(bySessionMap.values()),
     byProduct: Array.from(byProductMap.values()).sort((a, b) => b.revenue - a.revenue),
   };

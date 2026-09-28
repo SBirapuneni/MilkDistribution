@@ -1,6 +1,7 @@
 import { navHtml, wireNav } from '../components/nav';
 import { getMasterData, saveRoute } from '../api';
 import type { Route } from '../types';
+import { escapeHtml } from '../util';
 
 export async function renderRoutesAdmin(container: HTMLElement) {
   container.innerHTML = navHtml('routes') + '<main class="page"><h1>Routes</h1><div id="content">Loading...</div></main>';
@@ -16,7 +17,7 @@ export async function renderRoutesAdmin(container: HTMLElement) {
       wireList(routes);
       wireForm();
     } catch (err) {
-      content.innerHTML = `<p class="error">Failed to load: ${(err as Error).message}</p>`;
+      content.innerHTML = `<p class="error">Failed to load: ${escapeHtml((err as Error).message)}</p>`;
     }
   }
 
@@ -30,12 +31,12 @@ export async function renderRoutesAdmin(container: HTMLElement) {
             .map(
               (r) => `
             <tr>
-              <td>${r.Name}</td>
-              <td>${r.Villages}</td>
-              <td>${r.DefaultVehicle}</td>
-              <td>${r.DefaultDriver}</td>
+              <td>${escapeHtml(r.Name)}</td>
+              <td>${escapeHtml(r.Villages)}</td>
+              <td>${escapeHtml(r.DefaultVehicle)}</td>
+              <td>${escapeHtml(r.DefaultDriver)}</td>
               <td>${isActive(r.Active) ? 'Yes' : 'No'}</td>
-              <td><button class="edit-btn" type="button" data-id="${r.RouteId}">Edit</button></td>
+              <td><button class="edit-btn" type="button" data-id="${escapeHtml(r.RouteId)}">Edit</button></td>
             </tr>
           `,
             )
@@ -49,13 +50,13 @@ export async function renderRoutesAdmin(container: HTMLElement) {
     return `
       <h2>${editing ? 'Edit route' : 'Add route'}</h2>
       <form id="route-form">
-        <input type="hidden" name="routeId" value="${editing?.RouteId ?? ''}" />
+        <input type="hidden" name="routeId" value="${escapeHtml(editing?.RouteId)}" />
         <div class="field-row">
-          <label>Name <input type="text" name="name" value="${editing?.Name ?? ''}" required /></label>
-          <label>Villages <input type="text" name="villages" placeholder="comma-separated" value="${editing?.Villages ?? ''}" /></label>
-          <label>Default vehicle <input type="text" name="defaultVehicle" value="${editing?.DefaultVehicle ?? ''}" /></label>
-          <label>Default driver <input type="text" name="defaultDriver" value="${editing?.DefaultDriver ?? ''}" /></label>
-          <label><input type="checkbox" name="active" ${editing?.Active === false ? '' : 'checked'} /> Active</label>
+          <label>Name <input type="text" name="name" value="${escapeHtml(editing?.Name)}" required /></label>
+          <label>Villages <input type="text" name="villages" placeholder="comma-separated" value="${escapeHtml(editing?.Villages)}" /></label>
+          <label>Default vehicle <input type="text" name="defaultVehicle" value="${escapeHtml(editing?.DefaultVehicle)}" /></label>
+          <label>Default driver <input type="text" name="defaultDriver" value="${escapeHtml(editing?.DefaultDriver)}" /></label>
+          <label><input type="checkbox" name="active" ${editing && !isActive(editing.Active) ? '' : 'checked'} /> Active</label>
         </div>
         <button type="submit">Save</button>
         <p id="route-error" class="error"></p>
