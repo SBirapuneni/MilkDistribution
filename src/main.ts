@@ -1,5 +1,5 @@
 import './style.css';
-import { getToken, getUserName } from './api';
+import { getToken, getUserName, warmUp } from './api';
 import { renderPasscode } from './screens/passcode';
 import { renderDashboard } from './screens/dashboard';
 import { renderRouteScreen } from './screens/route';
@@ -39,5 +39,6 @@ function render() {
   }
 }
 
+warmUp();
 window.addEventListener('hashchange', render);
 render();

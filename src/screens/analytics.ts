@@ -103,10 +103,14 @@ export async function renderAnalytics(container: HTMLElement) {
     const prevFrom = compare ? addDays(prevTo, -(compare.days - 1)) : prevTo;
 
     try {
-      const [data, prev] = await Promise.all([
-        getAnalytics({ dateFrom: from, dateTo: to }),
-        compare ? getAnalytics({ dateFrom: prevFrom, dateTo: prevTo }).catch(() => null) : Promise.resolve(null),
-      ]);
+      // One request: the backend computes the comparison range from the same
+      // sheet read.
+      const data = await getAnalytics({
+        dateFrom: from,
+        dateTo: to,
+        previous: compare ? { dateFrom: prevFrom, dateTo: prevTo } : undefined,
+      });
+      const prev = data.previous ?? null;
       if (myRequest !== requestId) return; // a newer range was picked meanwhile
       const lastDate = data.byDate[data.byDate.length - 1]?.date;
       const ctx: Context = { from, to, days, compare, prev, partialLast: to === today && lastDate === today };

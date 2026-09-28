@@ -8,6 +8,7 @@ import type {
   MasterData,
   Product,
   Route,
+  RouteDay,
   Session,
   Trip,
   TripItem,
@@ -47,7 +48,7 @@ export async function saveProduct(payload: {
   unit: string;
   price: number;
   active: boolean;
-}): Promise<{ productId: string }> {
+}): Promise<{ productId: string } & MasterData> {
   if (!payload.name) throw new Error('Product name is required');
   if (payload.productId) {
     const existing = products.find((p) => p.ProductId === payload.productId);
@@ -56,11 +57,11 @@ export async function saveProduct(payload: {
     existing.Unit = payload.unit;
     existing.Price = payload.price;
     existing.Active = payload.active;
-    return { productId: existing.ProductId };
+    return { productId: existing.ProductId, ...(await getMasterData()) };
   }
   const id = newId('P');
   products.push({ ProductId: id, Name: payload.name, Unit: payload.unit, Price: payload.price, Active: payload.active });
-  return { productId: id };
+  return { productId: id, ...(await getMasterData()) };
 }
 
 export async function saveRoute(payload: {
@@ -70,7 +71,7 @@ export async function saveRoute(payload: {
   defaultVehicle: string;
   defaultDriver: string;
   active: boolean;
-}): Promise<{ routeId: string }> {
+}): Promise<{ routeId: string } & MasterData> {
   if (!payload.name) throw new Error('Route name is required');
   if (payload.routeId) {
     const existing = routes.find((r) => r.RouteId === payload.routeId);
@@ -80,7 +81,7 @@ export async function saveRoute(payload: {
     existing.DefaultVehicle = payload.defaultVehicle;
     existing.DefaultDriver = payload.defaultDriver;
     existing.Active = payload.active;
-    return { routeId: existing.RouteId };
+    return { routeId: existing.RouteId, ...(await getMasterData()) };
   }
   const id = newId('R');
   routes.push({
@@ -91,7 +92,7 @@ export async function saveRoute(payload: {
     DefaultDriver: payload.defaultDriver,
     Active: payload.active,
   });
-  return { routeId: id };
+  return { routeId: id, ...(await getMasterData()) };
 }
 
 export async function getTrip(routeId: string, date: string, session: Session): Promise<TripWithItems | null> {
@@ -99,6 +100,22 @@ export async function getTrip(routeId: string, date: string, session: Session): 
   if (!trip) return null;
   const items = tripItems.filter((i) => i.TripId === trip.TripId);
   return { trip: { ...trip }, items: items.map((i) => ({ ...i })) };
+}
+
+export async function getRouteDay(payload: {
+  routeId: string;
+  date: string;
+  session?: Session;
+  fallbackSession: Session;
+}): Promise<RouteDay> {
+  const dayTrips = trips.filter((t) => t.RouteId === payload.routeId && t.Date === payload.date);
+  const days = (await Promise.all(dayTrips.map((t) => getTrip(t.RouteId, t.Date, t.Session)))).filter(
+    (d): d is TripWithItems => d !== null,
+  );
+  const awaiting = (['Morning', 'Evening'] as Session[]).find((s) =>
+    days.some((d) => d.trip.Session === s && d.trip.Status === 'Dispatched'),
+  );
+  return { ...(await getMasterData()), session: payload.session ?? awaiting ?? payload.fallbackSession, trips: days };
 }
 
 export async function getLastTrip(routeId: string, session: Session, beforeDate: string): Promise<TripWithItems | null> {
@@ -260,7 +277,15 @@ export async function getTodayStatus(date: string): Promise<Trip[]> {
   return trips.filter((t) => t.Date === date).map((t) => ({ ...t }));
 }
 
-export async function getAnalytics(payload: { dateFrom?: string; dateTo?: string } = {}): Promise<Analytics> {
+export async function getAnalytics(
+  payload: { dateFrom?: string; dateTo?: string; previous?: { dateFrom: string; dateTo: string } } = {},
+): Promise<Analytics> {
+  const result = computeAnalytics(payload);
+  if (payload.previous) result.previous = computeAnalytics(payload.previous);
+  return result;
+}
+
+function computeAnalytics(payload: { dateFrom?: string; dateTo?: string }): Analytics {
   const settled = trips.filter((t) => {
     if (t.Status !== 'Settled') return false;
     if (payload.dateFrom && t.Date < payload.dateFrom) return false;

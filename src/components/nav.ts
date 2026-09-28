@@ -1,4 +1,4 @@
-import { clearToken } from '../api';
+import { clearMasterCache, clearToken } from '../api';
 
 const links = [
   { href: '#/', label: 'Dashboard', key: 'dashboard' },
@@ -20,6 +20,7 @@ export function navHtml(active: string): string {
 export function wireNav(container: ParentNode) {
   container.querySelector('#logout-btn')?.addEventListener('click', () => {
     clearToken();
+    clearMasterCache();
     window.location.hash = '#/';
     window.location.reload();
   });
